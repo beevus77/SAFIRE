@@ -52,7 +52,6 @@ timeout(time: 1, unit: 'HOURS') {
             sh 'mkdir $BUILD'
             sh '''
               cd $BUILD && cmake $SRC \
-                -DCMAKE_COLOR_DIAGNOSTICS=ON \
                 -GNinja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="." \
@@ -70,7 +69,6 @@ timeout(time: 1, unit: 'HOURS') {
           stage('asan_and_ubsan') {
             sh '''
               cd $BUILD && cmake $SRC \
-                -DCMAKE_COLOR_DIAGNOSTICS=ON \
                 -GNinja \
                 -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_INSTALL_PREFIX="." \
@@ -101,7 +99,6 @@ timeout(time: 1, unit: 'HOURS') {
           sh 'mkdir $BUILD'
           sh '''
             cd $BUILD && cmake $SRC \
-              -DCMAKE_COLOR_DIAGNOSTICS=ON \
               -GNinja \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX="." \

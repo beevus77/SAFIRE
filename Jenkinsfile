@@ -107,7 +107,7 @@ timeout(time: 1, unit: 'HOURS') {
               -DENABLE_CPPTRACE=OFF \
               -DENABLE_SPDLOG=ON \
               -DCTEST_NPROC=4 \
-              -DENABLE_CUDA=ON
+              -DENABLE_CUDA=ON --debug-find
           '''
           sh 'ninja -C $BUILD -j $PARALLEL'
           warnError("Tests failed") {

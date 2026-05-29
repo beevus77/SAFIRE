@@ -10,39 +10,82 @@ timeout(time: 1, unit: 'HOURS') {
         "SRC=$WORKSPACE",
         "BUILD=$WORKSPACE/build"
       ]) {
-        stage('release') {
-          sh 'mkdir $BUILD'
-          sh '''
-            cd $BUILD && cmake $SRC \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX="." \
-              -DCOMPILE_NDA_TESTS=OFF \
-              -DENABLE_FFTW=ON \
-              -DENABLE_CPPTRACE=OFF \
-              -DENABLE_SPDLOG=ON \
-              -DCTEST_NPROC=$PARALLEL
-          '''
-          sh 'make -C $BUILD -j $PARALLEL'
-          warnError("Tests failed") {
-            sh 'cd $BUILD && ctest --output-on-failure'
+        parallel python: {
+          stage('build docs') {
+            sh '''
+              python -m venv venv
+              cd $SRC/utils
+              pip install .[DOCS]
+              . venv/bin/activate
+              cd $SRC/docs
+              make html
+            '''
           }
-        }
-        stage('asan_and_ubsan') {
-          sh '''
-            cd $BUILD && cmake $SRC \
-              -DCMAKE_BUILD_TYPE=Debug \
-              -DCMAKE_INSTALL_PREFIX="." \
-              -DCOMPILE_NDA_TESTS=OFF \
-              -DENABLE_FFTW=ON \
-              -DENABLE_CPPTRACE=OFF \
-              -DENABLE_SPDLOG=ON \
-              -DENABLE_ASAN=ON \
-              -DENABLE_UBSAN=ON \
-              -DCTEST_NPROC=$PARALLEL
-          '''
-          sh 'make -C $BUILD -j $PARALLEL'
-          warnError("Tests on Debug with ASAN and UBSAN failed") {
-            sh 'cd $BUILD && ctest --output-on-failure'
+          if (env.BRANCH_NAME in ['main', 'docs-ci'] || env.TAG_NAME) {
+            stage('deploy docs') {
+              def scm = scmGit(branches: [[name: 'refs/heads/gh-pages']],
+                userRemoteConfigs: [[credentialsId: 'github-jenkins', url: 'https://github.com/SFQMC/sfqmc.github.io.git']])
+              dir(path: 'sfqmc.github.io') {
+                checkout(changelog: false, poll: false, scm: scm)
+                sh '''#!/bin/bash -e
+                  rm -rf docs/$BRANCH_NAME
+                  mkdir -p docs/$BRANCH_NAME
+                  cp -a $SRC/docs/_build/html/. docs/$BRANCH_NAME
+                  if [ -n "$TAG_NAME" ]; then
+                    LATEST=$(git -C $SRC tag --sort=-v:refname | head -n1)
+                    ln -sfn "$LATEST" docs/stable
+                  fi
+                  git add -A docs
+                  if git diff --cached --quiet; then
+                    echo "No documentation changes to deploy."
+                  else
+                    GIT_COMMITTER_EMAIL="jenkins@flatironinstitute.org" GIT_COMMITTER_NAME="SAFIRE CI" git commit --author='SAFIRE CI <jenkins@flatironinstitute.org>' --allow-empty -m "Update SAFIRE docs from build $BUILD_NUMBER"
+                  fi
+                '''
+                gitPush(gitScm: scm, targetBranch: 'gh-pages', targetRepo: 'origin')
+              }
+            }
+          }
+        },
+        cpp: {
+          stage('release') {
+            sh 'mkdir $BUILD'
+            sh '''
+              cd $BUILD && cmake $SRC \
+                -DCMAKE_COLOR_DIAGNOSTICS=ON \
+                -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="." \
+                -DCOMPILE_NDA_TESTS=OFF \
+                -DENABLE_FFTW=ON \
+                -DENABLE_CPPTRACE=OFF \
+                -DENABLE_SPDLOG=ON \
+                -DCTEST_NPROC=$PARALLEL
+            '''
+            sh 'ninja -C $BUILD -j $PARALLEL'
+            warnError("Tests failed") {
+              sh 'cd $BUILD && ctest --output-on-failure'
+            }
+          }
+          stage('asan_and_ubsan') {
+            sh '''
+              cd $BUILD && cmake $SRC \
+                -DCMAKE_COLOR_DIAGNOSTICS=ON \
+                -GNinja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_INSTALL_PREFIX="." \
+                -DCOMPILE_NDA_TESTS=OFF \
+                -DENABLE_FFTW=ON \
+                -DENABLE_CPPTRACE=OFF \
+                -DENABLE_SPDLOG=ON \
+                -DENABLE_ASAN=ON \
+                -DENABLE_UBSAN=ON \
+                -DCTEST_NPROC=$PARALLEL
+            '''
+            sh 'ninja -C $BUILD -j $PARALLEL'
+            warnError("Tests on Debug with ASAN and UBSAN failed") {
+              sh 'cd $BUILD && ctest --output-on-failure'
+            }
           }
         }
       }
@@ -58,6 +101,8 @@ timeout(time: 1, unit: 'HOURS') {
           sh 'mkdir $BUILD'
           sh '''
             cd $BUILD && cmake $SRC \
+              -DCMAKE_COLOR_DIAGNOSTICS=ON \
+              -GNinja \
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX="." \
               -DCOMPILE_NDA_TESTS=OFF \
@@ -67,7 +112,7 @@ timeout(time: 1, unit: 'HOURS') {
               -DCTEST_NPROC=4 \
               -DENABLE_CUDA=ON
           '''
-          sh 'make -C $BUILD -j $PARALLEL'
+          sh 'ninja -C $BUILD -j $PARALLEL'
           warnError("Tests failed") {
             sh 'cd $BUILD && ctest --output-on-failure'
           }

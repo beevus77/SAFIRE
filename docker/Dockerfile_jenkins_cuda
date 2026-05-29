@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y openssh-client git \
    gcc \
    g++ \
    cmake \
-   ninja \
+   ninja-build \
    openmpi-bin \
    openmpi-common \
    libopenmpi-dev \

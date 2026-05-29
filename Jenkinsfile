@@ -94,15 +94,13 @@ timeout(time: 1, unit: 'HOURS') {
     }
   },
   cuda: {
-    buildPod(context: 'docker', dockerfile: 'Dockerfile_jenkins_cuda', tag: 'cuda2', gpus: 1) {
+    buildPod(context: 'docker', dockerfile: 'Dockerfile_jenkins_cuda', tag: 'cuda3', gpus: 1) {
       withEnv([
         "SRC=$WORKSPACE",
         "BUILD=$WORKSPACE/build"
       ]) {
         stage('cuda') {
           sh 'mkdir $BUILD'
-          sh 'find /usr/lib/x86_64-linux-gnu'
-          sh 'dpkg-query -L libcutensor-dev'
           sh '''
             cd $BUILD && cmake $SRC \
               -GNinja \
@@ -113,7 +111,7 @@ timeout(time: 1, unit: 'HOURS') {
               -DENABLE_CPPTRACE=OFF \
               -DENABLE_SPDLOG=ON \
               -DCTEST_NPROC=4 \
-              -DENABLE_CUDA=ON --debug-find
+              -DENABLE_CUDA=ON
           '''
           sh 'ninja -C $BUILD -j $PARALLEL'
           warnError("Tests failed") {

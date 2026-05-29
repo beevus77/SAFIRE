@@ -23,4 +23,6 @@ RUN apt-get update && apt-get install -y \
    python3-h5py \
    python3-venv
 
-RUN touch /usr/lib/x86_64-linux-gnu/test_1
+# necessary for building BLIS within TBLIS
+ENV CC=/usr/bin/gcc
+ENV CXX=/usr/bin/g++

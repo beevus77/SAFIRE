@@ -13,7 +13,7 @@ timeout(time: 1, unit: 'HOURS') {
         parallel python: {
           stage('build docs') {
             sh '''
-              python -m venv venv
+              python3 -m venv venv
               cd $SRC/utils
               pip install .[DOCS]
               . venv/bin/activate

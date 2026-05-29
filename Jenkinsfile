@@ -70,6 +70,7 @@ timeout(time: 1, unit: 'HOURS') {
         },
         cpp_debug: {
           stage('debug_ubsan') {
+            sh 'mkdir $BUILD_DEBUG'
             sh '''
               cd $BUILD_DEBUG && cmake $SRC \
                 -GNinja \
@@ -93,7 +94,7 @@ timeout(time: 1, unit: 'HOURS') {
     }
   },
   cuda: {
-    buildPod(context: 'docker', dockerfile: 'Dockerfile_jenkins_cuda', tag: 'cuda', gpus: 1) {
+    buildPod(context: 'docker', dockerfile: 'Dockerfile_jenkins_cuda', tag: 'cuda2', gpus: 1) {
       withEnv([
         "SRC=$WORKSPACE",
         "BUILD=$WORKSPACE/build"

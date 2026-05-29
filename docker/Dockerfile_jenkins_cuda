@@ -22,3 +22,5 @@ RUN apt-get update && apt-get install -y \
    python3-mpi4py \
    python3-h5py \
    python3-venv
+
+RUN touch /usr/lib/x86_64-linux-gnu/test_1

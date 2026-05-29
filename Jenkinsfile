@@ -8,7 +8,7 @@ timeout(time: 1, unit: 'HOURS') {
     buildPod(context: 'docker', dockerfile: 'Dockerfile_jenkins') {
       withEnv([
         "SRC=$WORKSPACE",
-        "BUILD=$WORKSPACE/build"
+        "BUILD=$WORKSPACE/build",
         "BUILD_DEBUG=$WORKSPACE/build-debug"
       ]) {
         parallel python: {

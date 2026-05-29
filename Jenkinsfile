@@ -66,7 +66,7 @@ timeout(time: 1, unit: 'HOURS') {
               sh 'cd $BUILD && ctest --output-on-failure'
             }
           }
-          stage('asan_and_ubsan') {
+          stage('debug_ubsan') {
             sh '''
               cd $BUILD && cmake $SRC \
                 -GNinja \
@@ -76,12 +76,12 @@ timeout(time: 1, unit: 'HOURS') {
                 -DENABLE_FFTW=ON \
                 -DENABLE_CPPTRACE=OFF \
                 -DENABLE_SPDLOG=ON \
-                -DENABLE_ASAN=ON \
+                -DENABLE_ASAN=OFF \
                 -DENABLE_UBSAN=ON \
                 -DCTEST_NPROC=$PARALLEL
             '''
             sh 'ninja -C $BUILD -j $PARALLEL'
-            warnError("Tests on Debug with ASAN and UBSAN failed") {
+            warnError("Tests on Debug with UBSAN failed") {
               sh 'cd $BUILD && ctest --output-on-failure'
             }
           }

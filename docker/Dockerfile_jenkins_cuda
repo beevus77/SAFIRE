@@ -2,7 +2,9 @@ FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y openssh-client git \
+RUN apt-get update && apt-get install -y \
+   openssh-client \
+   git \
    gcc \
    g++ \
    cmake \

@@ -9,6 +9,7 @@ timeout(time: 1, unit: 'HOURS') {
       withEnv([
         "SRC=$WORKSPACE",
         "BUILD=$WORKSPACE/build"
+        "BUILD_DEBUG=$WORKSPACE/build-debug"
       ]) {
         parallel python: {
           stage('build docs') {
@@ -47,7 +48,7 @@ timeout(time: 1, unit: 'HOURS') {
             }
           }
         },
-        cpp: {
+        cpp_release: {
           stage('release') {
             sh 'mkdir $BUILD'
             sh '''
@@ -66,9 +67,11 @@ timeout(time: 1, unit: 'HOURS') {
               sh 'cd $BUILD && ctest --output-on-failure'
             }
           }
+        },
+        cpp_debug: {
           stage('debug_ubsan') {
             sh '''
-              cd $BUILD && cmake $SRC \
+              cd $BUILD_DEBUG && cmake $SRC \
                 -GNinja \
                 -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_INSTALL_PREFIX="." \
@@ -80,9 +83,9 @@ timeout(time: 1, unit: 'HOURS') {
                 -DENABLE_UBSAN=ON \
                 -DCTEST_NPROC=$PARALLEL
             '''
-            sh 'ninja -C $BUILD -j $PARALLEL'
+            sh 'ninja -C $BUILD_DEBUG -j $PARALLEL'
             warnError("Tests on Debug with UBSAN failed") {
-              sh 'cd $BUILD && ctest --output-on-failure'
+              sh 'cd $BUILD_DEBUG && ctest --output-on-failure'
             }
           }
         }

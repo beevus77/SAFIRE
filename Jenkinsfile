@@ -15,8 +15,8 @@ timeout(time: 1, unit: 'HOURS') {
             sh '''
               python3 -m venv venv
               cd $SRC/utils
-              pip install .[DOCS]
               . venv/bin/activate
+              pip install .[DOCS]
               cd $SRC/docs
               make html
             '''

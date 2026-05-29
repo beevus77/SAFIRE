@@ -97,6 +97,8 @@ timeout(time: 1, unit: 'HOURS') {
       ]) {
         stage('cuda') {
           sh 'mkdir $BUILD'
+          sh 'find /usr/lib/x86_64-linux-gnu'
+          sh 'dpkg-query -L libcutensor-dev'
           sh '''
             cd $BUILD && cmake $SRC \
               -GNinja \

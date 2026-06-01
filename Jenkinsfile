@@ -75,7 +75,6 @@ timeout(time: 1, unit: 'HOURS') {
                 -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_INSTALL_PREFIX="." \
                 -DCOMPILE_NDA_TESTS=OFF \
-                -DENABLE_FFTW=ON \
                 -DENABLE_CPPTRACE=OFF \
                 -DENABLE_SPDLOG=ON \
             '''

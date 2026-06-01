@@ -107,7 +107,7 @@ timeout(time: 1, unit: 'HOURS') {
           '''
           sh 'ninja -C $BUILD -j $PARALLEL'
           warnError("Tests failed") {
-            sh 'cd $BUILD && ctest --output-on-failure'
+            sh 'cd $BUILD && CUDA_LAUNCH_BLOCKING=1 ctest --output-on-failure'
           }
         }
       }

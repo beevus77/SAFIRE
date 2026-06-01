@@ -57,10 +57,8 @@ timeout(time: 1, unit: 'HOURS') {
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="." \
                 -DCOMPILE_NDA_TESTS=OFF \
-                -DENABLE_FFTW=ON \
                 -DENABLE_CPPTRACE=OFF \
                 -DENABLE_SPDLOG=ON \
-                -DCTEST_NPROC=$PARALLEL
             '''
             sh 'ninja -C $BUILD -j $PARALLEL'
             warnError("Tests failed") {
@@ -69,7 +67,7 @@ timeout(time: 1, unit: 'HOURS') {
           }
         },
         cpp_debug: {
-          stage('debug_ubsan') {
+          stage('debug') {
             sh 'mkdir $BUILD_DEBUG'
             sh '''
               cd $BUILD_DEBUG && cmake $SRC \
@@ -80,9 +78,6 @@ timeout(time: 1, unit: 'HOURS') {
                 -DENABLE_FFTW=ON \
                 -DENABLE_CPPTRACE=OFF \
                 -DENABLE_SPDLOG=ON \
-                -DENABLE_ASAN=OFF \
-                -DENABLE_UBSAN=ON \
-                -DCTEST_NPROC=$PARALLEL
             '''
             sh 'ninja -C $BUILD_DEBUG -j $PARALLEL'
             warnError("Tests on Debug with UBSAN failed") {
@@ -107,10 +102,8 @@ timeout(time: 1, unit: 'HOURS') {
               -DCMAKE_BUILD_TYPE=Release \
               -DCMAKE_INSTALL_PREFIX="." \
               -DCOMPILE_NDA_TESTS=OFF \
-              -DENABLE_FFTW=ON \
               -DENABLE_CPPTRACE=OFF \
               -DENABLE_SPDLOG=ON \
-              -DCTEST_NPROC=4 \
               -DENABLE_CUDA=ON
           '''
           sh 'ninja -C $BUILD -j $PARALLEL'

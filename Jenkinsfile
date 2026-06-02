@@ -103,7 +103,8 @@ timeout(time: 1, unit: 'HOURS') {
               -DCOMPILE_NDA_TESTS=OFF \
               -DENABLE_CPPTRACE=OFF \
               -DENABLE_SPDLOG=ON \
-              -DENABLE_CUDA=ON
+              -DENABLE_CUDA=ON \
+              -DCUDA_ARCH=70
           '''
           sh 'ninja -C $BUILD -j $PARALLEL'
           warnError("Tests failed") {

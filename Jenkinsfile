@@ -22,7 +22,7 @@ timeout(time: 1, unit: 'HOURS') {
               make html
             '''
           }
-          if (env.BRANCH_NAME in ['main', 'docs-ci'] || env.TAG_NAME) {
+          if (env.BRANCH_NAME in ['main', 'develop', 'overhaul', 'docs-ci'] || env.TAG_NAME) {
             stage('deploy docs') {
               def scm = scmGit(branches: [[name: 'refs/heads/gh-pages']],
                 userRemoteConfigs: [[credentialsId: 'github-jenkins', url: 'https://github.com/SFQMC/sfqmc.github.io.git']])

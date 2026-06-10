@@ -283,6 +283,76 @@ protected:
 	int NAEB, int ndets, std::vector<ComplexType>& coeffs, 
         std::vector<int>& occbuff, std::vector<PsiT_Matrix>& PsiT_MO);
 
+  static ptree strip_stochastic_factory_keys(ptree pt)
+  {
+    pt.erase("stochastic");
+    pt.erase("inner_nwalkers");
+    return pt;
+  }
+
+  template<bool MP, class MType, class... Rest>
+  static Wavefunction makeNomsdWavefunction(bool stochastic, AFQMCInfo& info, ptree pt, Rest&&... rest)
+  {
+    if (stochastic)
+      return Wavefunction(StochasticWfn<MP, MType>(info, std::move(pt), std::forward<Rest>(rest)...));
+    return Wavefunction(
+        NOMSD<MP, MType>(info, strip_stochastic_factory_keys(std::move(pt)), std::forward<Rest>(rest)...));
+  }
+
+  template<bool MP, class MType, class OrbsContainer>
+  Wavefunction buildNomsdWavefunction(bool stochastic,
+                                      AFQMCInfo& info,
+                                      ptree pt,
+                                      TaskGroup_& TGprop,
+                                      TaskGroup_& TGwfn,
+                                      Hamiltonian& h,
+                                      std::string const& restart_file,
+                                      WALKER_TYPES walker_type,
+                                      int NMO,
+                                      int NAEA,
+                                      int NAEB,
+                                      std::vector<PsiT_Matrix>& PsiT,
+                                      std::vector<ComplexType> ci,
+                                      OrbsContainer orbs,
+                                      ComplexType NCE,
+                                      int targetNW,
+                                      SlaterDetOperations sdet)
+  {
+    auto HOps = getHamOps<MP>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, TGprop, TGwfn, h);
+    TGwfn.Node().barrier();
+    return makeNomsdWavefunction<MP, MType>(stochastic, info, std::move(pt), TGwfn, std::move(sdet), std::move(HOps),
+                                            std::move(ci), std::move(orbs), walker_type, NCE, targetNW);
+  }
+
+  template<class MType, class OrbsContainer>
+  Wavefunction buildNomsdWavefunctionWithPrecision(bool mixed_precision,
+                                                     bool stochastic,
+                                                     AFQMCInfo& info,
+                                                     ptree pt,
+                                                     TaskGroup_& TGprop,
+                                                     TaskGroup_& TGwfn,
+                                                     Hamiltonian& h,
+                                                     std::string const& restart_file,
+                                                     WALKER_TYPES walker_type,
+                                                     int NMO,
+                                                     int NAEA,
+                                                     int NAEB,
+                                                     std::vector<PsiT_Matrix>& PsiT,
+                                                     std::vector<ComplexType> ci,
+                                                     OrbsContainer orbs,
+                                                     ComplexType NCE,
+                                                     int targetNW,
+                                                     SlaterDetOperations sdet)
+  {
+    if (mixed_precision)
+      return buildNomsdWavefunction<true, MType>(stochastic, info, std::move(pt), TGprop, TGwfn, h, restart_file,
+                                                 walker_type, NMO, NAEA, NAEB, PsiT, std::move(ci), std::move(orbs), NCE,
+                                                 targetNW, std::move(sdet));
+    return buildNomsdWavefunction<false, MType>(stochastic, info, std::move(pt), TGprop, TGwfn, h, restart_file,
+                                                walker_type, NMO, NAEA, NAEB, PsiT, std::move(ci), std::move(orbs), NCE,
+                                                targetNW, std::move(sdet));
+  }
+
   std::map<std::string, ptree> wfnBlocks;
 
   std::map<std::string, Wavefunction> wavefunctions;

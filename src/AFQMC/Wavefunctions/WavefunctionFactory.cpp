@@ -81,6 +81,14 @@ SlaterDetOperations WavefunctionFactory::makeSlaterDetOperations(int nmo_spins, 
       SlaterDetOperations_serial<ComplexType, DeviceBufferManager>(nmo_spins, naea, DeviceBufferManager{}));
 }
 
+WavefunctionFactory::NomsdSdetPair WavefunctionFactory::makeOuterInnerSlaterDetOperations(int nmo_spins,
+                                                                                            int naea,
+                                                                                            bool use_shared_layout)
+{
+  return {makeSlaterDetOperations(nmo_spins, naea, use_shared_layout),
+          makeSlaterDetOperations(nmo_spins, naea, use_shared_layout)};
+}
+
 
 Wavefunction WavefunctionFactory::fromHDF5(TaskGroup_& TGprop,
                                            TaskGroup_& TGwfn,
@@ -195,21 +203,40 @@ Wavefunction WavefunctionFactory::fromHDF5(TaskGroup_& TGprop,
 
     const int nmo_spins        = NPOL * NMO;
     const bool use_shared_sdet = nomsd_use_shared_sdet(TGwfn);
+
+    if (stochastic)
+    {
+      NomsdSdetPair sdets = makeOuterInnerSlaterDetOperations(nmo_spins, NAEA, use_shared_sdet);
+      if (dense_trial)
+      {
+        using MType = Matrix_<node_allocator<ComplexType>>;
+        auto PsiT_dense = dense_orbitals_from_sparse(TGwfn, PsiT);
+        return buildStochasticNomsdWavefunctionWithPrecision<MType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h,
+                                                                    restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
+                                                                    std::move(ci), std::move(PsiT_dense), NCE,
+                                                                    targetNW, std::move(sdets));
+      }
+      using SparseMType = local_csr_Matrix<ComplexType>;
+      return buildStochasticNomsdWavefunctionWithPrecision<SparseMType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h,
+                                                                        restart_file, walker_type, NMO, NAEA, NAEB,
+                                                                        PsiT, std::move(ci), std::move(PsiT), NCE,
+                                                                        targetNW, std::move(sdets));
+    }
+
     SlaterDetOperations SDetOp = makeSlaterDetOperations(nmo_spins, NAEA, use_shared_sdet);
 
     if (dense_trial)
     {
       using MType = Matrix_<node_allocator<ComplexType>>;
       auto PsiT_dense = dense_orbitals_from_sparse(TGwfn, PsiT);
-      return buildNomsdWavefunctionWithPrecision<MType>(mixed_precision, stochastic, AFinfo, pt, TGprop, TGwfn, h,
-                                                      restart_file, walker_type, NMO, NAEA, NAEB, PsiT, std::move(ci),
+      return buildNomsdWavefunctionWithPrecision<MType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h, restart_file,
+                                                      walker_type, NMO, NAEA, NAEB, PsiT, std::move(ci),
                                                       std::move(PsiT_dense), NCE, targetNW, std::move(SDetOp));
     }
     using SparseMType = local_csr_Matrix<ComplexType>;
-    return buildNomsdWavefunctionWithPrecision<SparseMType>(mixed_precision, stochastic, AFinfo, pt, TGprop, TGwfn, h,
-                                                          restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
-                                                          std::move(ci), std::move(PsiT), NCE, targetNW,
-                                                          std::move(SDetOp));
+    return buildNomsdWavefunctionWithPrecision<SparseMType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h, restart_file,
+                                                          walker_type, NMO, NAEA, NAEB, PsiT, std::move(ci),
+                                                          std::move(PsiT), NCE, targetNW, std::move(SDetOp));
   }
   else if (type == "phmsd")
   {

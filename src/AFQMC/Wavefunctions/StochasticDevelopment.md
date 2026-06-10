@@ -13,30 +13,49 @@ class that inherits from `AFQMCInfo` and owns:
 
 ```cpp
 StochasticInnerEnsemble inner_ensemble_;  // inner WalkerSet + RNG
-NOMSD<MP, devPsiT> nomsd_;
+NOMSD<MP, devPsiT> nomsd_;                 // outer delegate (outer-walker-facing)
+NOMSD<MP, devPsiT> inner_nomsd_;            // inner stack (independent HamOps + SDetOp)
 ```
 
 **Phase 1a is complete.** The inner trial ensemble (`inner_wset()`, sized by `inner_nwalkers`)
-is owned and initialized in a two-phase factory/driver workflow. **All Tier 1–6 visitor methods
-still delegate to `nomsd_` on outer walkers**, so outer-facing behavior remains identical to
-plain `NOMSD` in the delegate limit (`inner_nwalkers = 1`, no inner propagation).
+is owned and initialized in a two-phase factory/driver workflow.
 
-Inner `NOMSD` can be evaluated directly on `inner_wset()` via `inner_wfn()` for testing and
-future overrides.
+**Phase 1b is complete.** Outer and inner each have their own `NOMSD` instance with
+independently constructed `HamiltonianOperations` and `SlaterDetOperations` (cloned CI and
+orbitals for the inner copy). **All Tier 1–6 visitor methods still delegate to `nomsd_` (outer)
+on outer walkers**, so outer-facing behavior remains identical to plain `NOMSD` in the delegate
+limit (`inner_nwalkers = 1`, no inner propagation).
 
-### Factory integration (scaffolding only)
+Inner `NOMSD` is evaluated directly on `inner_wset()` via `inner_wfn()` / `inner_nomsd()` for
+testing and future overrides.
+
+### Factory integration
 
 - Selected via the input flag `stochastic: true` inside the existing `type == "nomsd"` path
   in `WavefunctionFactory::fromHDF5`.
 - Optional `inner_nwalkers` (default `1`; requires `stochastic: true`).
 - Reads the same NOMSD HDF5 data (`Wavefunction/NOMSD`, `PsiT_*`, CI coefficients, etc.).
-- Construction is routed through `makeNomsdWavefunction()`, which chooses `StochasticWfn` or
-  `NOMSD` at the last step. Stochastic-specific keys are stripped before plain `NOMSD`
-  construction; `StochasticWfn` strips them again before its inner `nomsd_`.
+- When `stochastic: true`, `fromHDF5` builds a `NomsdSdetPair` upfront and routes through
+  `buildStochasticNomsdWavefunctionWithPrecision()` (separate from the plain `NOMSD` path).
+- Plain `NOMSD` builds use `buildNomsdWavefunctionWithPrecision()`; the `stochastic` flag is
+  no longer threaded through those templates.
+- Stochastic-specific keys are stripped via `strip_stochastic_factory_keys()` before plain
+  `NOMSD` construction; `StochasticWfn` strips them again before constructing each inner/outer
+  `NOMSD`.
 - Registered as four explicit instantiations in the `Wavefunction` `boost::variant`.
 - **Two-phase inner-walker init:** (1) construct `StochasticWfn`; (2) call
   `maybe_initialize_stochastic_inner_walkers()` from `WavefunctionFactory` (drivers and tests)
   once `getInitialGuess()` and the outer-walker input block are available.
+
+**Dual-bundle factory helpers** (`WavefunctionFactory.h` / `.cpp`):
+
+| Helper | Role |
+|--------|------|
+| `NomsdSdetPair` / `makeOuterInnerSlaterDetOperations()` | Two independent `SlaterDetOperations` instances (same layout flags). |
+| `NomsdHamOpsPair` / `makeOuterInnerHamOps()` | Two independent `getHamOps()` builds (in-place brace init; `HamOps` is move-only). |
+| `clone_orbitals()` | Deep copy of CI/orbital vectors for the inner `NOMSD`. |
+| `buildStochasticNomsdWavefunction*()` | Assembles `StochasticWfn` with outer/inner infrastructure bundles. |
+| `buildNomsdWavefunction*()` | Plain `NOMSD` only (no stochastic branching). |
 
 This is intentionally **not** first-class like `PHMSD` (no separate HDF5 type, no dedicated
 factory branch). That remains deferred to Phase 8.
@@ -46,7 +65,8 @@ factory branch). That remains deferred to Phase 8.
 | Accessor | Role |
 |----------|------|
 | `inner_wset()` | Owned inner `WalkerSet` (stochastic trial ensemble) |
-| `inner_wfn()` | Inner `NOMSD` (may be renamed `inner_nomsd()` later) |
+| `inner_wfn()` / `inner_nomsd()` | Inner `NOMSD` (independent HamOps/SDetOp) |
+| `outer_nomsd()` | Outer delegate `NOMSD` (same object as `nomsd_`) |
 | `inner_walkers_initialized()` | Whether phase-2 init has run |
 | `inner_nwalkers()` | Parsed ensemble size |
 
@@ -54,16 +74,21 @@ factory branch). That remains deferred to Phase 8.
 `stochastic_inner_walkers_initialized()`, `stochastic_inner_wset()`, and
 `initialize_stochastic_inner_walkers()`.
 
+**Outer-facing infrastructure today:** `getSlaterDetOperations()` and all Tier 1–6 methods use
+`nomsd_` (outer). Inner `HamOps`/`SDetOp` live inside `inner_nomsd_` and are not exposed
+through the public `StochasticWfn` facade yet (Phase 7 may realign layout queries and SDetOp
+access).
+
 ---
 
 ## Target Architecture
 
 > **Future expectation:** Each `StochasticWfn` instance will own its own inner AFQMC stack:
 >
-> - **Walker set** — stochastic ensemble defining the trial wavefunction
-> - **NOMSD** — analytic MSD structure evaluated on inner walkers
-> - **Propagator(s)** — drives the inner stochastic evolution
-> - **HamiltonianOperations (`HamOps`)** — inner Hamiltonian coupling for energy, bias, and forces
+> - **Walker set** — stochastic ensemble defining the trial wavefunction *(Phase 1a)*
+> - **NOMSD** — analytic MSD structure evaluated on inner walkers, with its own HamOps/SDetOp *(Phase 1b)*
+> - **Propagator(s)** — drives the inner stochastic evolution *(Phase 1c)*
+> - **Effective outer quantities** — overlap, local energy, mixed DM, bias potentials reduced from the inner ensemble *(Phases 2–5)*
 >
 > The outer AFQMC driver will call `StochasticWfn` methods as it does for `NOMSD`/`PHMSD` today;
 > `StochasticWfn` will orchestrate the inner calculation and return effective quantities
@@ -122,9 +147,10 @@ Called during propagator setup and mean-field initialization.
 
 ### Tier 4 — Layout and metadata queries
 
-Currently forwarded from `nomsd_` / inner `HamOp`. Must remain **consistent** with what the
-overridden Tier 1–3 methods actually produce; may need custom logic once inner `HamOps` is owned
-separately.
+Currently forwarded from **outer** `nomsd_` / its `HamOp`. Inner `inner_nomsd_` has matching
+layout metadata (verified in Phase 1b tests) but is not yet the source of outer-facing queries.
+Must remain **consistent** with what the overridden Tier 1–3 methods actually produce; may need
+custom logic once inner propagation and stochastic outputs diverge from the delegate limit.
 
 | Method | Current behavior | Desired functionality |
 |--------------------------------------------------------------------------------|----------------------------------------------------------------|----------------------------------------------------------------------------------------|
@@ -143,8 +169,8 @@ separately.
 
 ### Tier 5 — Hamiltonian and Slater infrastructure
 
-May continue to delegate to inner objects early on, but ownership should eventually move into
-`StochasticWfn`.
+Outer-facing calls delegate to `nomsd_`. Inner `HamOps`/`SDetOp` are owned inside
+`inner_nomsd_` (Phase 1b); public accessors still return outer infrastructure until Phase 7.
 
 | Method | Current behavior | Desired functionality |
 |--------------------------------------------------------------------------------|----------------------------------------------------------------|----------------------------------------------------------------------------------------|
@@ -176,9 +202,9 @@ Not wavefunction visitor methods, but required for a full-fledged type.
 
 | Component | Current behavior | Desired functionality |
 |--------------------------------------------------------------------------------|----------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| `StochasticWfn` constructor | Builds inner `nomsd_` and parses `inner_nwalkers`; defers inner `WalkerSet` resize. | Phase 1b+: add independent `HamOps`/`SDetOp` and inner propagator members. |
+| `StochasticWfn` constructor | Builds outer `nomsd_` and inner `inner_nomsd_` with separate HamOps/SDetOp bundles; parses `inner_nwalkers`; defers inner `WalkerSet` resize. | Phase 1c+: add owned inner propagator member. |
 | `interpret_inputs(pt)` | Validates `NOMSD` keys plus `stochastic` / `inner_nwalkers` (default `1`). | Defer `inner_steps`, population control, propagator type, etc. |
-| `WavefunctionFactory` | `stochastic: true` on NOMSD HDF5 path; `maybe_initialize_stochastic_inner_walkers()` after build. | First-class `stochasticwfn` type with its own `fromHDF5` branch (Phase 8). |
+| `WavefunctionFactory` | `stochastic: true` on NOMSD HDF5 path; dual-bundle build via `buildStochasticNomsdWavefunction*`; `maybe_initialize_stochastic_inner_walkers()` after build. | First-class `stochasticwfn` type with its own `fromHDF5` branch (Phase 8). |
 | `getWavefunctionType()` | Not aware of `StochasticWfn`. | Detect stochastic trial wavefunction files on disk. |
 
 ---
@@ -199,24 +225,37 @@ with no change to outer-facing behavior.
 | Members | `StochasticInnerEnsemble` with `unique_ptr<WalkerSet>`, RNG, and init flag. |
 | Inputs | `inner_nwalkers` (default `1`) in `StochasticWfn` and `WavefunctionFactory` input. |
 | Initialization | Two-phase init via `initialize_inner_walkers()` / `maybe_initialize_stochastic_inner_walkers()` in factory and all AFQMC drivers. |
-| Public API | Tier 1–6 methods still delegate to `nomsd_` on outer walkers. Accessors `inner_wset()`, `inner_wfn()`. |
+| Public API | Tier 1–6 methods still delegate to `nomsd_` on outer walkers. Accessors `inner_wset()`, `inner_wfn()` / `inner_nomsd()`, `outer_nomsd()`. |
 | Task group | Same `TGwfn` as inner `NOMSD`. |
 | Tests | `stochastic_wfn_matches_nomsd`, `stochastic_inner_walkers_init`, `stochastic_inner_walkers_uninitialized_smoke` in `test_wfn_factory.cpp`. |
 
-**Still deferred (post-1a):** separate `HamOps`/`SDetOp` ownership, inner propagator, overriding
-`Overlap`/`Energy`, first-class HDF5 type.
+**Deferred after 1a (now addressed in 1b or later):** inner propagator (1c), overriding
+`Overlap`/`Energy` (Phase 2), first-class HDF5 type (Phase 8).
 
-### Phase 1b — Independent inner `HamOps` and `SDetOp` (next)
+### Phase 1b — Independent inner `HamOps` and `SDetOp` (**complete**)
 
-Duplicate the factory's `getHamOps()` + `SlaterDetOperations` build for a second inner `NOMSD`
-instance (or refactor `NOMSD` ownership if needed). `HamOps` currently lives inside `NOMSD`;
-this phase makes the inner stack truly independent from the objects moved in at construction
-today.
+**Goal:** Duplicate the factory's `getHamOps()` + `SlaterDetOperations` build for a second inner
+`NOMSD` so the inner stack is truly independent of the outer delegate. `HamOps` still lives
+inside each `NOMSD`; Phase 1b adds a second `NOMSD` with its own moved-in infrastructure rather
+than splitting `HamOps` out of `NOMSD` globally.
 
-**Verify:** layout metadata (`local_number_of_cholesky_vectors`, transpose flags) matches;
-`inner_nomsd` still evaluates correctly on `inner_wset`.
+| Item | Status |
+|------|--------|
+| Members | `nomsd_` (outer delegate) + `inner_nomsd_` (inner stack). |
+| Constructor | Accepts outer/inner `SlaterDetOperations` and `HamiltonianOperations` bundles plus cloned CI/orbitals for inner. |
+| Accessors | `inner_nomsd()`, `outer_nomsd()`; `inner_wfn()` aliases inner. |
+| Factory | `makeOuterInnerSlaterDetOperations`, `makeOuterInnerHamOps`, `buildStochasticNomsdWavefunction*`; plain path unchanged. |
+| Outer behavior | Tier 1–6 still delegate to `nomsd_`; `getSlaterDetOperations()` returns outer SDetOp. |
+| Tests | `stochastic_inner_outer_infrastructure_independent` in `test_wfn_factory.cpp`. |
 
-### Phase 1c — Inner propagator (static default)
+**Verified:** distinct outer/inner `NOMSD` and `SlaterDetOperations` pointers; matching layout
+metadata (Cholesky counts, transpose flags, `size_of_G_for_vbias`, walker/Ham types); inner
+overlap/energy on `inner_wset()` matches plain `NOMSD` at delegate limit.
+
+**Still deferred (post-1b):** inner propagator (1c), overriding `Overlap`/`Energy`, routing
+layout/SDetOp queries through inner stack where appropriate (Phase 7).
+
+### Phase 1c — Inner propagator (static default) (**next**)
 
 Add an owned inner propagator member. Default `inner_nsteps = 0` (no propagation; static
 ensemble). Wiring through `PropagatorFactory` comes here, not in 1a.
@@ -259,7 +298,7 @@ Remove the `stochastic` boolean flag hack; dedicated `fromHDF5` branch like `PHM
 - **Building the inner propagator before inner walkers exist** — highest coupling, hardest to
   test, and useless until `Overlap`/`Energy` consume the ensemble.
 - **Splitting `HamOps` out of `NOMSD` globally** — a `NOMSD` refactor, not a `StochasticWfn`
-  feature; save for 1b when a second copy is actually needed.
+  feature; Phase 1b instead duplicates full `NOMSD` instances with separate moved-in `HamOps`.
 
 ---
 
@@ -271,6 +310,7 @@ Compare against the current `nomsd_` delegate in the limit where the inner ensem
 to a single deterministic state (`inner_nwalkers = 1`, `inner_nsteps = 0`):
 
 - `stochastic_wfn_matches_nomsd` continues to pass unchanged at default inputs.
+- `stochastic_inner_outer_infrastructure_independent` confirms dual infrastructure without breaking delegate-limit observables.
 - Outer propagator completes without layout/runtime check failures.
 - Local energy and overlap match analytic `NOMSD` within stochastic error bars.
 - Mixed estimator (`MixedObsHandler`) forces and densities are consistent.
@@ -286,7 +326,26 @@ In `test_wfn_factory.cpp` / `WfnTestContext`:
 | `stochastic_inner_walkers_init` | Inner walkers initialize to `inner_nwalkers`; Slater matrices match `getInitialGuess()`; inner `NOMSD` overlap/energy on `inner_wset()` matches reference; replicated ensemble gives identical observables. |
 | `stochastic_inner_walkers_uninitialized_smoke` | Stochastic wavefunction built without `walker_pt` stays uninitialized until `maybe_initialize_stochastic_inner_walkers()`; then `stochastic_inner_wset()` is usable. (`inner_wset()` before init calls `APP_ABORT` — not exercised in-process.) |
 
-### Phase 1a follow-ups (not yet validated)
+### Phase 1b-specific tests (implemented)
+
+Requires a **NOMSD** HDF5 input (`getWavefunctionType() == "NOMSD"`); PHMSD inputs skip checks.
+
+| Test case | Checkpoint |
+|-----------|------------|
+| `stochastic_inner_outer_infrastructure_independent` | `outer_nomsd()` and `inner_nomsd()` are distinct objects with distinct `getSlaterDetOperations()` pointers; `StochasticWfn::getSlaterDetOperations()` returns outer; inner/outer layout metadata match (Cholesky distribution, transpose flags, `size_of_G_for_vbias`, walker/Ham types); inner overlap/energy on `inner_wset()` match plain `NOMSD` reference. |
+
+Run (after building `test_afqmc_wavefunctions`):
+
+```bash
+./test_afqmc_wavefunctions \
+  --hamil /path/to/hamil.h5 \
+  --wfn /path/to/nomsd_wfn.h5 \
+  stochastic_inner_outer_infrastructure_independent
+```
+
+All stochastic tests: filter tag `[stochastic_wfn]`.
+
+### Integration follow-ups (not yet validated)
 
 - Outer propagator completes without layout/runtime failures with `stochastic: true`.
 - Mixed estimator (`MixedObsHandler`) forces and densities remain consistent.

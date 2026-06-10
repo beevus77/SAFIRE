@@ -37,22 +37,57 @@ namespace afqmc
 
 namespace
 {
-ptree strip_stochastic_factory_keys(ptree pt)
+std::vector<Matrix_<node_allocator<ComplexType>>> dense_orbitals_from_sparse(TaskGroup_& TGwfn,
+                                                                              std::vector<PsiT_Matrix> const& PsiT)
 {
-  pt.erase("stochastic");
-  pt.erase("inner_nwalkers");
-  return pt;
-}
-
-template<bool MP, class MType, class... Rest>
-Wavefunction makeNomsdWavefunction(bool stochastic, AFQMCInfo& info, ptree pt, Rest&&... rest)
-{
-  if (stochastic)
-    return Wavefunction(StochasticWfn<MP, MType>(info, std::move(pt), std::forward<Rest>(rest)...));
-  return Wavefunction(
-      NOMSD<MP, MType>(info, strip_stochastic_factory_keys(std::move(pt)), std::forward<Rest>(rest)...));
+  using MType = Matrix_<node_allocator<ComplexType>>;
+  std::vector<MType> PsiT_dense;
+  PsiT_dense.reserve(PsiT.size());
+  auto alloc_shared_(make_node_allocator<ComplexType>(TGwfn));
+  for (auto const& v : PsiT)
+  {
+    PsiT_dense.emplace_back(MType({v.size(0), v.size(1)}, alloc_shared_));
+    ma::Matrix2MAREF('N', v, PsiT_dense.back());
+  }
+  return PsiT_dense;
 }
 } // namespace
+
+bool WavefunctionFactory::nomsd_use_shared_sdet(TaskGroup_& TGwfn)
+{
+#if !defined(ENABLE_DEVICE)
+  return TGwfn.TG_local().size() > 1;
+#else
+  (void)TGwfn;
+  return false;
+#endif
+}
+
+bool WavefunctionFactory::phmsd_use_shared_sdet(TaskGroup_& TGwfn)
+{
+#if !defined(ENABLE_CUDA) && !defined(ENABLE_HIP)
+  return TGwfn.TG_local().size() > 1;
+#else
+  (void)TGwfn;
+  return false;
+#endif
+}
+
+SlaterDetOperations WavefunctionFactory::makeSlaterDetOperations(int nmo_spins, int naea, bool use_shared_layout)
+{
+  if (use_shared_layout)
+    return SlaterDetOperations(SlaterDetOperations_shared<ComplexType>(nmo_spins, naea));
+  return SlaterDetOperations(
+      SlaterDetOperations_serial<ComplexType, DeviceBufferManager>(nmo_spins, naea, DeviceBufferManager{}));
+}
+
+WavefunctionFactory::NomsdSdetPair WavefunctionFactory::makeOuterInnerSlaterDetOperations(int nmo_spins,
+                                                                                            int naea,
+                                                                                            bool use_shared_layout)
+{
+  return {makeSlaterDetOperations(nmo_spins, naea, use_shared_layout),
+          makeSlaterDetOperations(nmo_spins, naea, use_shared_layout)};
+}
 
 
 Wavefunction WavefunctionFactory::fromHDF5(TaskGroup_& TGprop,
@@ -166,110 +201,42 @@ Wavefunction WavefunctionFactory::fromHDF5(TaskGroup_& TGprop,
       dense_trial = *dense_trial_opt;
     }
 
-#if !defined(ENABLE_DEVICE)
-    if (TGwfn.TG_local().size() > 1)
+    const int nmo_spins        = NPOL * NMO;
+    const bool use_shared_sdet = nomsd_use_shared_sdet(TGwfn);
+
+    if (stochastic)
     {
-      SlaterDetOperations SDetOp(SlaterDetOperations_shared<ComplexType>(NPOL * NMO, NAEA));
+      NomsdSdetPair sdets = makeOuterInnerSlaterDetOperations(nmo_spins, NAEA, use_shared_sdet);
       if (dense_trial)
       {
         using MType = Matrix_<node_allocator<ComplexType>>;
-        std::vector<MType> PsiT_;
-        PsiT_.reserve(PsiT.size());
-        auto alloc_shared_(make_node_allocator<ComplexType>(TGwfn));
-        for (auto& v : PsiT)
-        {
-          PsiT_.emplace_back(MType({v.size(0), v.size(1)}, alloc_shared_));
-          ma::Matrix2MAREF('N', v, PsiT_.back());
-        }
-        if(mixed_precision) {
-          auto HOps(getHamOps<true>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, 
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier();
-          return makeNomsdWavefunction<true, MType>(stochastic, AFinfo, pt, TGwfn, std::move(SDetOp),
-                                                  std::move(HOps), std::move(ci), std::move(PsiT_), walker_type, NCE,
-                                                  targetNW);
-	} else {
-          auto HOps(getHamOps<false>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, 
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier();
-          return makeNomsdWavefunction<false, MType>(stochastic, AFinfo, pt, TGwfn, std::move(SDetOp),
-                                                     std::move(HOps), std::move(ci), std::move(PsiT_), walker_type,
-                                                     NCE, targetNW);
-        }
+        auto PsiT_dense = dense_orbitals_from_sparse(TGwfn, PsiT);
+        return buildStochasticNomsdWavefunctionWithPrecision<MType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h,
+                                                                    restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
+                                                                    std::move(ci), std::move(PsiT_dense), NCE,
+                                                                    targetNW, std::move(sdets));
       }
-      else
-      {
-        if(mixed_precision) {
-          auto HOps(getHamOps<true>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, 
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier();	
-          return makeNomsdWavefunction<true, local_csr_Matrix<ComplexType>>(stochastic, AFinfo, pt, TGwfn,
-                                                                            std::move(SDetOp), std::move(HOps),
-                                                                            std::move(ci), std::move(PsiT), walker_type,
-                                                                            NCE, targetNW);
-	} else {
-          auto HOps(getHamOps<false>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, 
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier();
-          return makeNomsdWavefunction<false, local_csr_Matrix<ComplexType>>(stochastic, AFinfo, pt, TGwfn,
-                                                                             std::move(SDetOp), std::move(HOps),
-                                                                             std::move(ci), std::move(PsiT),
-                                                                             walker_type, NCE, targetNW);
-	}
-      }
+      using SparseMType = local_csr_Matrix<ComplexType>;
+      return buildStochasticNomsdWavefunctionWithPrecision<SparseMType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h,
+                                                                        restart_file, walker_type, NMO, NAEA, NAEB,
+                                                                        PsiT, std::move(ci), std::move(PsiT), NCE,
+                                                                        targetNW, std::move(sdets));
     }
-    else
-#endif
+
+    SlaterDetOperations SDetOp = makeSlaterDetOperations(nmo_spins, NAEA, use_shared_sdet);
+
+    if (dense_trial)
     {
-      SlaterDetOperations SDetOp(
-          SlaterDetOperations_serial<ComplexType, DeviceBufferManager>(NPOL * NMO, NAEA, DeviceBufferManager{}));
-      if (dense_trial)
-      {
-        using MType = Matrix_<node_allocator<ComplexType>>;
-        std::vector<MType> PsiT_;
-        PsiT_.reserve(PsiT.size());
-        auto alloc_shared_(make_node_allocator<ComplexType>(TGwfn));
-        for (auto& v : PsiT)
-        {
-          PsiT_.emplace_back(MType({v.size(0), v.size(1)}, alloc_shared_));
-          ma::Matrix2MAREF('N', v, PsiT_.back());
-        }
-        if(mixed_precision) {
-          auto HOps(getHamOps<true>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, 
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier(); 
-          return makeNomsdWavefunction<true, MType>(stochastic, AFinfo, pt, TGwfn, std::move(SDetOp), std::move(HOps),
-                                                    std::move(ci), std::move(PsiT_), walker_type, NCE, targetNW);
-        } else { 
-          auto HOps(getHamOps<false>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier(); 
-          return makeNomsdWavefunction<false, MType>(stochastic, AFinfo, pt, TGwfn, std::move(SDetOp),
-                                                     std::move(HOps), std::move(ci), std::move(PsiT_), walker_type,
-                                                     NCE, targetNW);
-        }
-      }
-      else
-      {
-        if(mixed_precision) {
-          auto HOps(getHamOps<true>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, 
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier(); 
-          return makeNomsdWavefunction<true, local_csr_Matrix<ComplexType>>(stochastic, AFinfo, pt, TGwfn,
-                                                                            std::move(SDetOp), std::move(HOps),
-                                                                            std::move(ci), std::move(PsiT), walker_type,
-                                                                            NCE, targetNW);
-        } else { 
-          auto HOps(getHamOps<false>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, 
-		TGprop, TGwfn, h));
-          TGwfn.Node().barrier(); 
-          return makeNomsdWavefunction<false, local_csr_Matrix<ComplexType>>(stochastic, AFinfo, pt, TGwfn,
-                                                                             std::move(SDetOp), std::move(HOps),
-                                                                             std::move(ci), std::move(PsiT),
-                                                                             walker_type, NCE, targetNW);
-        }
-      }
+      using MType = Matrix_<node_allocator<ComplexType>>;
+      auto PsiT_dense = dense_orbitals_from_sparse(TGwfn, PsiT);
+      return buildNomsdWavefunctionWithPrecision<MType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h, restart_file,
+                                                      walker_type, NMO, NAEA, NAEB, PsiT, std::move(ci),
+                                                      std::move(PsiT_dense), NCE, targetNW, std::move(SDetOp));
     }
+    using SparseMType = local_csr_Matrix<ComplexType>;
+    return buildNomsdWavefunctionWithPrecision<SparseMType>(mixed_precision, AFinfo, pt, TGprop, TGwfn, h, restart_file,
+                                                          walker_type, NMO, NAEA, NAEB, PsiT, std::move(ci),
+                                                          std::move(PsiT), NCE, targetNW, std::move(SDetOp));
   }
   else if (type == "phmsd")
   {
@@ -493,54 +460,26 @@ Wavefunction WavefunctionFactory::fromHDF5(TaskGroup_& TGprop,
     det_coupling_matrix.emplace_back( unsorted_det_coupling[1] );
     TGwfn.Node().barrier();
 
-#if !defined(ENABLE_CUDA) && !defined(ENABLE_HIP)
-    if (TGwfn.TG_local().size() > 1)
-    {
-      SlaterDetOperations SDetOp(SlaterDetOperations_shared<ComplexType>(NPOL * NMO, NAEA));
-      if(mixed_precision) {
-        auto HOps(getHamOps<true>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
+    const int nmo_spins        = NPOL * NMO;
+    const bool use_shared_sdet = phmsd_use_shared_sdet(TGwfn);
+    SlaterDetOperations SDetOp = makeSlaterDetOperations(nmo_spins, NAEA, use_shared_sdet);
+    if(mixed_precision) {
+      auto HOps(getHamOps<true>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
 		TGprop, TGwfn, h));
-        TGwfn.Node().barrier();
-        return Wavefunction(PHMSD<true>(AFinfo, pt, TGwfn, std::move(SDetOp), std::move(HOps),
-                    std::move(acta2mo), std::move(actb2mo), std::move(abij), 
-                    std::move(det_coupling_matrix),
-                    std::move(PsiT), walker_type, NCE, targetNW));
-      } else {
-        auto HOps(getHamOps<false>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
+      TGwfn.Node().barrier();
+      return Wavefunction(PHMSD<true>(AFinfo, pt, TGwfn, std::move(SDetOp), std::move(HOps),
+                  std::move(acta2mo), std::move(actb2mo), std::move(abij), 
+                  std::move(det_coupling_matrix),
+                  std::move(PsiT), walker_type, NCE, targetNW));
+    } else {
+      auto HOps(getHamOps<false>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
 		TGprop, TGwfn, h));
-        TGwfn.Node().barrier();
-        return Wavefunction(PHMSD<false>(AFinfo, pt, TGwfn, std::move(SDetOp), std::move(HOps),
-                    std::move(acta2mo), std::move(actb2mo), std::move(abij), 
-                    std::move(det_coupling_matrix),
-                    std::move(PsiT), walker_type, NCE, targetNW));
-      }
-    } 
-    else 
-#endif
-    {
-      SlaterDetOperations SDetOp(
-                SlaterDetOperations_serial<ComplexType, DeviceBufferManager>(NPOL * NMO, 
-                        NAEA, DeviceBufferManager{})
-                                );
-      if(mixed_precision) {
-        auto HOps(getHamOps<true>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
-		TGprop, TGwfn, h));
-        TGwfn.Node().barrier();
-        return Wavefunction(PHMSD<true>(AFinfo, pt, TGwfn, std::move(SDetOp), std::move(HOps),
-                    std::move(acta2mo), std::move(actb2mo), std::move(abij), 
-                    std::move(det_coupling_matrix),
-                    std::move(PsiT), walker_type, NCE, targetNW));
-      } else {
-        auto HOps(getHamOps<false>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT,
-		TGprop, TGwfn, h));
-        TGwfn.Node().barrier();
-        return Wavefunction(PHMSD<false>(AFinfo, pt, TGwfn, std::move(SDetOp), std::move(HOps),
-                    std::move(acta2mo), std::move(actb2mo), std::move(abij), 
-                    std::move(det_coupling_matrix),
-                    std::move(PsiT), walker_type, NCE, targetNW));
-      }
+      TGwfn.Node().barrier();
+      return Wavefunction(PHMSD<false>(AFinfo, pt, TGwfn, std::move(SDetOp), std::move(HOps),
+                  std::move(acta2mo), std::move(actb2mo), std::move(abij), 
+                  std::move(det_coupling_matrix),
+                  std::move(PsiT), walker_type, NCE, targetNW));
     }
-
   }
   else
   {

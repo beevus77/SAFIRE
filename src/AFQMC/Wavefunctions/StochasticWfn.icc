@@ -44,7 +44,7 @@ void StochasticWfn<MP, devPsiT>::initialize_inner_walkers(ptree const& walker_pt
     APP_ABORT("Error in StochasticWfn::initialize_inner_walkers: inner walkers already initialized.");
   inner_ensemble_.wset =
       std::make_unique<WalkerSet>(TG_, walker_pt, static_cast<AFQMCInfo&>(*this), &inner_ensemble_.rng);
-  if (getWalkerType() == COLLINEAR)
+  if (inner_nomsd_.getWalkerType() == COLLINEAR)
     inner_ensemble_.wset->resize(inner_nwalkers_, initial_guess[0],
                                  initial_guess[1](initial_guess.extension(1), {0, NAEB}));
   else

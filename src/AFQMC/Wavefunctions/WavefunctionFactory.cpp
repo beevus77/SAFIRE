@@ -37,34 +37,6 @@ namespace afqmc
 
 namespace
 {
-bool nomsd_use_shared_sdet(TaskGroup_& TGwfn)
-{
-#if !defined(ENABLE_DEVICE)
-  return TGwfn.TG_local().size() > 1;
-#else
-  (void)TGwfn;
-  return false;
-#endif
-}
-
-bool phmsd_use_shared_sdet(TaskGroup_& TGwfn)
-{
-#if !defined(ENABLE_CUDA) && !defined(ENABLE_HIP)
-  return TGwfn.TG_local().size() > 1;
-#else
-  (void)TGwfn;
-  return false;
-#endif
-}
-
-SlaterDetOperations makeSlaterDetOperations(int nmo_spins, int naea, bool use_shared_layout)
-{
-  if (use_shared_layout)
-    return SlaterDetOperations(SlaterDetOperations_shared<ComplexType>(nmo_spins, naea));
-  return SlaterDetOperations(
-      SlaterDetOperations_serial<ComplexType, DeviceBufferManager>(nmo_spins, naea, DeviceBufferManager{}));
-}
-
 std::vector<Matrix_<node_allocator<ComplexType>>> dense_orbitals_from_sparse(TaskGroup_& TGwfn,
                                                                               std::vector<PsiT_Matrix> const& PsiT)
 {
@@ -80,6 +52,34 @@ std::vector<Matrix_<node_allocator<ComplexType>>> dense_orbitals_from_sparse(Tas
   return PsiT_dense;
 }
 } // namespace
+
+bool WavefunctionFactory::nomsd_use_shared_sdet(TaskGroup_& TGwfn)
+{
+#if !defined(ENABLE_DEVICE)
+  return TGwfn.TG_local().size() > 1;
+#else
+  (void)TGwfn;
+  return false;
+#endif
+}
+
+bool WavefunctionFactory::phmsd_use_shared_sdet(TaskGroup_& TGwfn)
+{
+#if !defined(ENABLE_CUDA) && !defined(ENABLE_HIP)
+  return TGwfn.TG_local().size() > 1;
+#else
+  (void)TGwfn;
+  return false;
+#endif
+}
+
+SlaterDetOperations WavefunctionFactory::makeSlaterDetOperations(int nmo_spins, int naea, bool use_shared_layout)
+{
+  if (use_shared_layout)
+    return SlaterDetOperations(SlaterDetOperations_shared<ComplexType>(nmo_spins, naea));
+  return SlaterDetOperations(
+      SlaterDetOperations_serial<ComplexType, DeviceBufferManager>(nmo_spins, naea, DeviceBufferManager{}));
+}
 
 
 Wavefunction WavefunctionFactory::fromHDF5(TaskGroup_& TGprop,

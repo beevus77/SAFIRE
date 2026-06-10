@@ -31,7 +31,8 @@ namespace afqmc
 {
 /*
  * Stochastic trial wavefunction wrapper.
- * Currently delegates all operations to an internal NOMSD object.
+ * Owns an outer NOMSD delegate (nomsd_) for outer-walker-facing operations and a
+ * separate inner NOMSD (inner_nomsd_) with its own HamOps/SDetOp for the inner ensemble.
  */
 template<bool MP, class devPsiT>
 class StochasticWfn : public AFQMCInfo
@@ -47,6 +48,7 @@ class StochasticWfn : public AFQMCInfo
   StochasticInnerEnsemble inner_ensemble_;
   int inner_nwalkers_{1};
   NOMSD<MP, devPsiT> nomsd_;
+  NOMSD<MP, devPsiT> inner_nomsd_;
 
   static ptree nomsd_inputs(ptree const& pt0)
   {
@@ -61,17 +63,23 @@ public:
   StochasticWfn(AFQMCInfo& info,
                 ptree pt_in,
                 afqmc::TaskGroup_& tg_,
-                SlaterDetOperations&& sdet_,
-                HamiltonianOperations<MP>&& hop_,
+                SlaterDetOperations&& outer_sdet_,
+                HamiltonianOperations<MP>&& outer_hop_,
+                SlaterDetOperations&& inner_sdet_,
+                HamiltonianOperations<MP>&& inner_hop_,
                 std::vector<ComplexType>&& ci_,
                 std::vector<MType>&& orbs_,
+                std::vector<ComplexType>&& inner_ci_,
+                std::vector<MType>&& inner_orbs_,
                 WALKER_TYPES wlk,
                 ComplexType nce,
                 [[maybe_unused]] int targetNW = 1)
       : AFQMCInfo(info),
         TG_(tg_),
-        nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(sdet_), std::move(hop_), std::move(ci_), std::move(orbs_),
-               wlk, nce, targetNW)
+        nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(outer_sdet_), std::move(outer_hop_), std::move(ci_),
+               std::move(orbs_), wlk, nce, targetNW),
+        inner_nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(inner_sdet_), std::move(inner_hop_),
+                     std::move(inner_ci_), std::move(inner_orbs_), wlk, nce, targetNW)
   {
     ptree pt = interpret_inputs(pt_in);
     inner_nwalkers_ = pt.get<int>("inner_nwalkers");
@@ -115,8 +123,14 @@ public:
   WalkerSet& inner_wset();
   WalkerSet const& inner_wset() const;
 
-  NOMSD<MP, devPsiT>& inner_wfn() { return nomsd_; }
-  NOMSD<MP, devPsiT> const& inner_wfn() const { return nomsd_; }
+  NOMSD<MP, devPsiT>& inner_wfn() { return inner_nomsd_; }
+  NOMSD<MP, devPsiT> const& inner_wfn() const { return inner_nomsd_; }
+
+  NOMSD<MP, devPsiT>& inner_nomsd() { return inner_nomsd_; }
+  NOMSD<MP, devPsiT> const& inner_nomsd() const { return inner_nomsd_; }
+
+  NOMSD<MP, devPsiT>& outer_nomsd() { return nomsd_; }
+  NOMSD<MP, devPsiT> const& outer_nomsd() const { return nomsd_; }
 
   int local_number_of_cholesky_vectors() const { return nomsd_.local_number_of_cholesky_vectors(); }
   int global_number_of_cholesky_vectors() const { return nomsd_.global_number_of_cholesky_vectors(); }

@@ -293,11 +293,14 @@ protected:
   template<bool MP, class MType, class... Rest>
   static Wavefunction makeNomsdWavefunction(bool stochastic, AFQMCInfo& info, ptree pt, Rest&&... rest)
   {
-    if (stochastic)
-      return Wavefunction(StochasticWfn<MP, MType>(info, std::move(pt), std::forward<Rest>(rest)...));
+    (void)stochastic;
     return Wavefunction(
         NOMSD<MP, MType>(info, strip_stochastic_factory_keys(std::move(pt)), std::forward<Rest>(rest)...));
   }
+
+  static bool nomsd_use_shared_sdet(TaskGroup_& TGwfn);
+  static bool phmsd_use_shared_sdet(TaskGroup_& TGwfn);
+  static SlaterDetOperations makeSlaterDetOperations(int nmo_spins, int naea, bool use_shared_layout);
 
   template<bool MP, class MType, class OrbsContainer>
   Wavefunction buildNomsdWavefunction(bool stochastic,
@@ -318,6 +321,27 @@ protected:
                                       int targetNW,
                                       SlaterDetOperations sdet)
   {
+    if (stochastic)
+    {
+      const int nmo_spins        = ((walker_type == NONCOLLINEAR) ? 2 : 1) * NMO;
+      const bool use_shared_sdet = nomsd_use_shared_sdet(TGwfn);
+      SlaterDetOperations inner_sdet = makeSlaterDetOperations(nmo_spins, NAEA, use_shared_sdet);
+      auto outer_hops                = getHamOps<MP>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, TGprop, TGwfn, h);
+      auto inner_hops                = getHamOps<MP>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, TGprop, TGwfn, h);
+      TGwfn.Node().barrier();
+
+      std::vector<ComplexType> inner_ci(ci);
+      OrbsContainer inner_orbs;
+      inner_orbs.reserve(orbs.size());
+      for (auto const& orb : orbs)
+        inner_orbs.push_back(orb);
+
+      return Wavefunction(StochasticWfn<MP, MType>(info, std::move(pt), TGwfn, std::move(sdet), std::move(outer_hops),
+                                                   std::move(inner_sdet), std::move(inner_hops), std::move(ci),
+                                                   std::move(orbs), std::move(inner_ci), std::move(inner_orbs),
+                                                   walker_type, NCE, targetNW));
+    }
+
     auto HOps = getHamOps<MP>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, TGprop, TGwfn, h);
     TGwfn.Node().barrier();
     return makeNomsdWavefunction<MP, MType>(stochastic, info, std::move(pt), TGwfn, std::move(sdet), std::move(HOps),

@@ -29,6 +29,11 @@
 //#include "AFQMC/HamiltonianOperations/HamOpsIO.hpp"
 #include "AFQMC/Wavefunctions/Excitations.hpp"
 #include "Memory/buffer_managers.h"
+// Inner-propagator build for StochasticWfn (Phase 1c). Kept out of WavefunctionFactory.h
+// so that header stays free of Propagator includes.
+#include "AFQMC/Propagators/PropagatorFactory.h"
+#include "Memory/device_rng.hpp"
+#include "Utilities/Random.hpp"
 
 namespace sfqmc
 {
@@ -52,12 +57,26 @@ std::vector<Matrix_<node_allocator<ComplexType>>> dense_orbitals_from_sparse(Tas
   return PsiT_dense;
 }
 
-// Concrete inner stack for StochasticWfn. The inner NOMSD is held inside a heap-allocated
-// Wavefunction variant so a future inner Propagator can bind a stable Wavefunction&.
+// Exposes PropagatorFactory::buildPropagator (protected) for the StochasticWfn inner
+// stack without modifying PropagatorFactory. Unlike getPropagator, this builds an
+// unregistered Propagator the caller owns directly.
+struct InnerPropagatorBuilder : PropagatorFactory
+{
+  using PropagatorFactory::PropagatorFactory;
+  using PropagatorFactory::buildPropagator;
+};
+
+// Concrete inner stack for StochasticWfn. Members are heap-allocated because the
+// Propagator stores Wavefunction& and DeviceRandomGenerator_t* — both must remain
+// address-stable while the owning StochasticWfn is moved into the Wavefunction variant
+// and then into the factory map. Declaration order fixes destruction order: the
+// Propagator (which references wfn_ and rng_) is destroyed first.
 template<bool MP, class MType>
 struct StochasticInnerStackImpl final : StochasticInnerStack<MP, MType>
 {
+  std::unique_ptr<utils::DeviceRandomGenerator_t> rng_;
   std::unique_ptr<Wavefunction> wfn_;
+  std::unique_ptr<Propagator> prop_;
 
   NOMSD<MP, MType>& nomsd() override { return boost::get<NOMSD<MP, MType>>(*wfn_); }
   NOMSD<MP, MType> const& nomsd() const override { return boost::get<NOMSD<MP, MType>>(*wfn_); }
@@ -65,14 +84,18 @@ struct StochasticInnerStackImpl final : StochasticInnerStack<MP, MType>
   Wavefunction& wavefunction() override { return *wfn_; }
   Wavefunction const& wavefunction() const override { return *wfn_; }
 
-  bool has_propagator() const override { return false; }
+  bool has_propagator() const override { return prop_ != nullptr; }
   Propagator& propagator() override
   {
-    throw std::runtime_error("Error in StochasticInnerStackImpl::propagator: not built yet.");
+    if (prop_ == nullptr)
+      throw std::runtime_error("Error in StochasticInnerStackImpl::propagator: not built.");
+    return *prop_;
   }
   Propagator const& propagator() const override
   {
-    throw std::runtime_error("Error in StochasticInnerStackImpl::propagator: not built yet.");
+    if (prop_ == nullptr)
+      throw std::runtime_error("Error in StochasticInnerStackImpl::propagator: not built.");
+    return *prop_;
   }
 };
 } // namespace
@@ -91,13 +114,37 @@ std::unique_ptr<StochasticInnerStack<MP, MType>> WavefunctionFactory::buildStoch
     ComplexType NCE,
     int targetNW)
 {
-  (void)TGprop;
   auto stack = std::make_unique<StochasticInnerStackImpl<MP, MType>>();
 
+  // Inner NOMSD construction mirrors StochasticWfn::nomsd_inputs to preserve
+  // delegate-limit parity with the pre-1c inner_nomsd_ member.
   ptree nomsd_pt = NOMSD<MP, MType>::interpret_inputs(strip_stochastic_input_keys(pt));
   stack->wfn_    = std::make_unique<Wavefunction>(
       NOMSD<MP, MType>(info, std::move(nomsd_pt), TGwfn, std::move(inner_sdet), std::move(inner_hop),
                        std::move(inner_ci), std::move(inner_orbs), walker_type, NCE, targetNW));
+
+  // Optional inner_propagator block; inject "system"/"name" like DriverFactory::get_or_push.
+  ptree prop_pt;
+  if (auto child = pt.get_child_optional("inner_propagator"))
+    prop_pt = *child;
+  if (not prop_pt.get_child_optional("system"))
+    prop_pt.put("system", pt.get<std::string>("system"));
+  if (not prop_pt.get_child_optional("name"))
+    prop_pt.put("name", pt.get<std::string>("name") + "_inner_propagator");
+
+  // Dedicated device RNG, rank-decorrelated like the driver propagator RNG
+  // (inner_seed = 0 selects a time-based seed, matching the driver "seed" convention).
+  int inner_seed = pt.get<int>("inner_seed", 777);
+  auto iseed     = (inner_seed == 0) ? utils::make_seed(TGwfn.Global()) : utils::split_seed(inner_seed, TGwfn.Global());
+  stack->rng_    = std::make_unique<utils::DeviceRandomGenerator_t>(utils::make_device_rng(iseed));
+
+  // TGprop pairing mirrors the outer driver: the inner HamOps was built with the same
+  // (TGprop, TGwfn) pair as the outer, and propagator-side CV distribution and vMF
+  // reductions assume TGprop geometry. See StochasticDevelopment.md, Phase 1c.
+  app_log(2, " Building StochasticWfn inner propagator (inner_seed = {}).", inner_seed);
+  InnerPropagatorBuilder prop_builder(InfoMap, MP);
+  stack->prop_ = std::make_unique<Propagator>(
+      prop_builder.buildPropagator(TGprop, std::move(prop_pt), stack->wavefunction(), stack->rng_.get()));
 
   return stack;
 }

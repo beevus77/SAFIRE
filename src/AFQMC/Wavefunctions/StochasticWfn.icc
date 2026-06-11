@@ -53,6 +53,22 @@ void StochasticWfn<MP, devPsiT>::initialize_inner_walkers(ptree const& walker_pt
 }
 
 template<bool MP, class devPsiT>
+Propagator& StochasticWfn<MP, devPsiT>::inner_propagator()
+{
+  if (not inner_stack_->has_propagator())
+    APP_ABORT("Error in StochasticWfn::inner_propagator: inner propagator not built.");
+  return inner_stack_->propagator();
+}
+
+template<bool MP, class devPsiT>
+Propagator const& StochasticWfn<MP, devPsiT>::inner_propagator() const
+{
+  if (not inner_stack_->has_propagator())
+    APP_ABORT("Error in StochasticWfn::inner_propagator: inner propagator not built.");
+  return inner_stack_->propagator();
+}
+
+template<bool MP, class devPsiT>
 template<class Mat>
 void StochasticWfn<MP, devPsiT>::G_MF(Mat&& G)
 {

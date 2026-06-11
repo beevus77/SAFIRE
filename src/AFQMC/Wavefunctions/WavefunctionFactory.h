@@ -356,7 +356,10 @@ protected:
   }
 
   // Assembles the inner stack of a StochasticWfn: inner NOMSD wrapped in a heap-allocated
-  // Wavefunction. Defined in WavefunctionFactory.cpp so this header does not need Propagator.hpp.
+  // Wavefunction, the inner Propagator built against it via PropagatorFactory, and the
+  // device RNG the propagator samples. Defined in WavefunctionFactory.cpp (the only TU
+  // that instantiates it, via buildStochasticNomsdWavefunction below) so that this header
+  // does not need Propagator.hpp.
   template<bool MP, class MType, class OrbsContainer>
   std::unique_ptr<StochasticInnerStack<MP, MType>> buildStochasticInnerStack(AFQMCInfo& info,
                                                                              ptree const& pt,

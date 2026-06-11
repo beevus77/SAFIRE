@@ -77,7 +77,7 @@ struct StochasticInnerStack
  * Stochastic trial wavefunction wrapper.
  * Owns an outer NOMSD delegate (nomsd_) for outer-walker-facing operations and an inner
  * stack (inner_stack_) holding the inner NOMSD — with its own HamOps/SDetOp — wrapped in
- * a Wavefunction; inner Propagator wiring follows in the next commit (Phase 1c).
+ * a Wavefunction, plus the inner Propagator (Phase 1c; static ensemble, inner_nsteps = 0).
  */
 template<bool MP, class devPsiT>
 class StochasticWfn : public AFQMCInfo
@@ -185,6 +185,14 @@ public:
 
   NOMSD<MP, devPsiT>& inner_nomsd() { return inner_stack_->nomsd(); }
   NOMSD<MP, devPsiT> const& inner_nomsd() const { return inner_stack_->nomsd(); }
+
+  // Inner NOMSD wrapped as a Wavefunction (the object the inner Propagator is bound to).
+  Wavefunction& inner_wavefunction() { return inner_stack_->wavefunction(); }
+  Wavefunction const& inner_wavefunction() const { return inner_stack_->wavefunction(); }
+
+  bool inner_propagator_built() const { return inner_stack_->has_propagator(); }
+  Propagator& inner_propagator();
+  Propagator const& inner_propagator() const;
 
   NOMSD<MP, devPsiT>& outer_nomsd() { return nomsd_; }
   NOMSD<MP, devPsiT> const& outer_nomsd() const { return nomsd_; }

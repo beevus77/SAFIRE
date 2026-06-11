@@ -355,6 +355,21 @@ protected:
     return cloned;
   }
 
+  // Assembles the inner stack of a StochasticWfn: inner NOMSD wrapped in a heap-allocated
+  // Wavefunction. Defined in WavefunctionFactory.cpp so this header does not need Propagator.hpp.
+  template<bool MP, class MType, class OrbsContainer>
+  std::unique_ptr<StochasticInnerStack<MP, MType>> buildStochasticInnerStack(AFQMCInfo& info,
+                                                                             ptree const& pt,
+                                                                             TaskGroup_& TGprop,
+                                                                             TaskGroup_& TGwfn,
+                                                                             SlaterDetOperations&& inner_sdet,
+                                                                             HamiltonianOperations<MP>&& inner_hop,
+                                                                             std::vector<ComplexType>&& inner_ci,
+                                                                             OrbsContainer&& inner_orbs,
+                                                                             WALKER_TYPES walker_type,
+                                                                             ComplexType NCE,
+                                                                             int targetNW);
+
   template<bool MP, class MType, class OrbsContainer>
   Wavefunction buildStochasticNomsdWavefunction(AFQMCInfo& info,
                                                 ptree pt,
@@ -376,11 +391,13 @@ protected:
     auto hops      = makeOuterInnerHamOps<MP>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, TGprop, TGwfn, h);
     auto inner_ci  = clone_orbitals(ci);
     auto inner_orbs = clone_orbitals(orbs);
+    auto inner_stack = buildStochasticInnerStack<MP, MType>(info, pt, TGprop, TGwfn, std::move(sdets.inner),
+                                                            std::move(hops.inner), std::move(inner_ci),
+                                                            std::move(inner_orbs), walker_type, NCE, targetNW);
     TGwfn.Node().barrier();
-    return Wavefunction(StochasticWfn<MP, MType>(
-        info, std::move(pt), TGwfn, std::move(sdets.outer), std::move(hops.outer), std::move(sdets.inner),
-        std::move(hops.inner), std::move(ci), std::move(orbs), std::move(inner_ci), std::move(inner_orbs), walker_type,
-        NCE, targetNW));
+    return Wavefunction(StochasticWfn<MP, MType>(info, std::move(pt), TGwfn, std::move(sdets.outer),
+                                                 std::move(hops.outer), std::move(ci), std::move(orbs),
+                                                 std::move(inner_stack), walker_type, NCE, targetNW));
   }
 
   template<class MType, class OrbsContainer>

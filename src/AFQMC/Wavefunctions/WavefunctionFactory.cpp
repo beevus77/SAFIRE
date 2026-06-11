@@ -51,7 +51,56 @@ std::vector<Matrix_<node_allocator<ComplexType>>> dense_orbitals_from_sparse(Tas
   }
   return PsiT_dense;
 }
+
+// Concrete inner stack for StochasticWfn. The inner NOMSD is held inside a heap-allocated
+// Wavefunction variant so a future inner Propagator can bind a stable Wavefunction&.
+template<bool MP, class MType>
+struct StochasticInnerStackImpl final : StochasticInnerStack<MP, MType>
+{
+  std::unique_ptr<Wavefunction> wfn_;
+
+  NOMSD<MP, MType>& nomsd() override { return boost::get<NOMSD<MP, MType>>(*wfn_); }
+  NOMSD<MP, MType> const& nomsd() const override { return boost::get<NOMSD<MP, MType>>(*wfn_); }
+
+  Wavefunction& wavefunction() override { return *wfn_; }
+  Wavefunction const& wavefunction() const override { return *wfn_; }
+
+  bool has_propagator() const override { return false; }
+  Propagator& propagator() override
+  {
+    throw std::runtime_error("Error in StochasticInnerStackImpl::propagator: not built yet.");
+  }
+  Propagator const& propagator() const override
+  {
+    throw std::runtime_error("Error in StochasticInnerStackImpl::propagator: not built yet.");
+  }
+};
 } // namespace
+
+template<bool MP, class MType, class OrbsContainer>
+std::unique_ptr<StochasticInnerStack<MP, MType>> WavefunctionFactory::buildStochasticInnerStack(
+    AFQMCInfo& info,
+    ptree const& pt,
+    TaskGroup_& TGprop,
+    TaskGroup_& TGwfn,
+    SlaterDetOperations&& inner_sdet,
+    HamiltonianOperations<MP>&& inner_hop,
+    std::vector<ComplexType>&& inner_ci,
+    OrbsContainer&& inner_orbs,
+    WALKER_TYPES walker_type,
+    ComplexType NCE,
+    int targetNW)
+{
+  (void)TGprop;
+  auto stack = std::make_unique<StochasticInnerStackImpl<MP, MType>>();
+
+  ptree nomsd_pt = NOMSD<MP, MType>::interpret_inputs(strip_stochastic_input_keys(pt));
+  stack->wfn_    = std::make_unique<Wavefunction>(
+      NOMSD<MP, MType>(info, std::move(nomsd_pt), TGwfn, std::move(inner_sdet), std::move(inner_hop),
+                       std::move(inner_ci), std::move(inner_orbs), walker_type, NCE, targetNW));
+
+  return stack;
+}
 
 bool WavefunctionFactory::nomsd_use_shared_sdet(TaskGroup_& TGwfn)
 {

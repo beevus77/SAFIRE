@@ -32,9 +32,13 @@ construction time, with a dedicated device RNG. Default `inner_nsteps = 0`: the 
 is wired but **not invoked**; the inner ensemble remains static until Phase 2b overrides
 `Energy` and enables `inner_nsteps > 0`.
 
-**Phase 2a (Overlap) is implemented (pending build + test).** `Overlap` reduces the inner
-ensemble into an effective stochastic-trial overlap per Eq. 24 of arXiv:2505.18519 in the
-static-ensemble limit; see [Stochastic overlap (Phase 2a)](#stochastic-overlap-phase-2a).
+**Phase 2a (Overlap) is complete (CPU-verified).** `Overlap` reduces the inner ensemble into
+an effective stochastic-trial overlap per Eq. 24 of arXiv:2505.18519 in the static-ensemble
+limit; see [Stochastic overlap (Phase 2a)](#stochastic-overlap-phase-2a). All `[stochastic_wfn]`
+tests pass on CPU. `stochastic_overlap_matches_nomsd` confirms **inner_nwalkers invariance**
+(with `wfn_msd.h5`) and **delegate-limit equality** (`stochastic overlap == NOMSD`, with
+`C_1x1x1_dzvp/wfn_rhf.h5` + `ham_chol_sc.h5`); see
+[Phase 2a-specific tests](#phase-2a-specific-tests-implemented).
 
 **Phase 2b (Energy) is next.** `Energy` still delegates to `nomsd_`; the Tier 1 density/bias
 methods (`MixedDensityMatrix_for_vbias`, `vbias`, `vHS`) also still delegate. Until 2b is done,
@@ -520,7 +524,7 @@ tests pass on CPU build with `wfn_msd.h5`.
 **Still deferred (post-1c):** invoking `inner_propagator()` from overrides, enabling
 `inner_nsteps > 0`, routing layout/SDetOp queries through inner stack where appropriate (Phase 7).
 
-### Phase 2a — Stochastic `Overlap` (**implemented; pending build + test**)
+### Phase 2a — Stochastic `Overlap` (**complete**)
 
 **Goal:** Override `Overlap` to reduce the inner ensemble into an effective stochastic-trial
 overlap per outer walker. First Tier 1 method to diverge from the `nomsd_` delegate.
@@ -533,7 +537,9 @@ overlap per outer walker. First Tier 1 method to diverge from the `nomsd_` deleg
 | Propagator | **Hybrid** mode consumes this override directly |
 | Tests | `stochastic_overlap_matches_nomsd` |
 
-**Pending:** CPU build and test; see [Phase 2a-specific tests](#phase-2a-specific-tests-implemented).
+**Verified (CPU):** all `[stochastic_wfn]` tests pass. `stochastic_overlap_matches_nomsd`:
+- **inner_nwalkers invariance** — `wfn_msd.h5` (`inner_nwalkers = 1` vs `= 3`, static replicated ensemble);
+- **delegate limit** — `C_1x1x1_dzvp/wfn_rhf.h5` + `ham_chol_sc.h5` (`stochastic overlap == NOMSD` at `ndet == 1`).
 
 ### Phase 2b — Stochastic `Energy` (**next**)
 
@@ -599,9 +605,10 @@ to a single deterministic state (`inner_nwalkers = 1`, `inner_nsteps = 0`):
 - `stochastic_wfn_matches_nomsd` continues to pass unchanged at default inputs.
 - `stochastic_inner_outer_infrastructure_independent` confirms dual infrastructure without breaking delegate-limit observables.
 - `stochastic_inner_propagator_construction` confirms inner propagator wiring without changing outer behavior.
-- `stochastic_overlap_matches_nomsd` confirms the overridden `Overlap` matches NOMSD at the single-determinant delegate limit and is invariant to `inner_nwalkers` in the static limit *(pending CPU verification)*.
+- `stochastic_overlap_matches_nomsd` — **verified (CPU):** inner_nwalkers invariance (`wfn_msd.h5`); delegate-limit overlap equality (`wfn_rhf.h5` + `ham_chol_sc.h5`).
+- `stochastic_energy_matches_nomsd` *(Phase 2b — not yet implemented)* — stochastic local energy equals NOMSD at delegate limit.
 - Outer propagator completes without layout/runtime check failures *(integration follow-up)*.
-- Local energy and overlap match analytic `NOMSD` within stochastic error bars.
+- Local energy and overlap match analytic `NOMSD` within stochastic error bars *(Phase 2b — overlap done in hybrid mode via 2a; local-energy mode pending 2b)*.
 - Mixed estimator (`MixedObsHandler`) forces and densities are consistent *(integration follow-up)*.
 - GPU memory and task-group load remain acceptable with the additional inner ensemble *(integration follow-up)*.
 
@@ -641,7 +648,11 @@ checkpoint (1) runs.
 |-----------|------------|
 | `stochastic_overlap_matches_nomsd` | `Overlap` in isolation (no following `Energy`): (1) **inner_nwalkers invariance**; (2) **delegate limit** — stochastic overlap equals NOMSD at `ndet == 1`. |
 
-Run the delegate-limit anchor with a single-determinant file, e.g.:
+**Verified (CPU):**
+- Checkpoint (1): `wfn_msd.h5` + `ham_chol_sc.h5`
+- Checkpoint (2): `C_1x1x1_dzvp/wfn_rhf.h5` + `ham_chol_sc.h5`
+
+Example (delegate-limit anchor):
 
 ```bash
 HAMIL=/path/to/SAFIRE/tests/unit_test_files/C_1x1x1_dzvp/ham_chol_sc.h5

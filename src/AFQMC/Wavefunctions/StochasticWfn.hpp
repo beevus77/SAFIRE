@@ -30,6 +30,18 @@ namespace sfqmc
 namespace afqmc
 {
 /*
+ * Strips all StochasticWfn-specific keys from a wavefunction input block, leaving a
+ * plain-NOMSD input. Single source of truth for the stochastic key set; used by
+ * StochasticWfn::nomsd_inputs and WavefunctionFactory::strip_stochastic_factory_keys.
+ */
+inline ptree strip_stochastic_input_keys(ptree pt)
+{
+  for (auto const& key : {"stochastic", "inner_nwalkers", "inner_nsteps", "inner_seed", "inner_propagator"})
+    pt.erase(key);
+  return pt;
+}
+
+/*
  * Stochastic trial wavefunction wrapper.
  * Owns an outer NOMSD delegate (nomsd_) for outer-walker-facing operations and a
  * separate inner NOMSD (inner_nomsd_) with its own HamOps/SDetOp for the inner ensemble.
@@ -47,15 +59,13 @@ class StochasticWfn : public AFQMCInfo
   afqmc::TaskGroup_& TG_;
   StochasticInnerEnsemble inner_ensemble_;
   int inner_nwalkers_{1};
+  int inner_nsteps_{0};
   NOMSD<MP, devPsiT> nomsd_;
   NOMSD<MP, devPsiT> inner_nomsd_;
 
   static ptree nomsd_inputs(ptree const& pt0)
   {
-    ptree pt_nomsd_in = pt0;
-    pt_nomsd_in.erase("stochastic");
-    pt_nomsd_in.erase("inner_nwalkers");
-    return NOMSD<MP, devPsiT>::interpret_inputs(pt_nomsd_in);
+    return NOMSD<MP, devPsiT>::interpret_inputs(strip_stochastic_input_keys(pt0));
   }
 
 public:
@@ -83,6 +93,7 @@ public:
   {
     ptree pt = interpret_inputs(pt_in);
     inner_nwalkers_ = pt.get<int>("inner_nwalkers");
+    inner_nsteps_   = pt.get<int>("inner_nsteps");
     app_log(2, "\nStochasticWfn input:\n{}\n", io::to_string(pt));
   }
 
@@ -92,7 +103,18 @@ public:
     int inner_nwalkers = pt0.get<int>("inner_nwalkers", 1);
     if (inner_nwalkers < 1)
       APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nwalkers must be >= 1.");
+    int inner_nsteps = pt0.get<int>("inner_nsteps", 0);
+    if (inner_nsteps < 0)
+      APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps must be >= 0.");
+    if (inner_nsteps > 0)
+      APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps > 0 not yet supported "
+                "(inner propagation arrives with Phase 2+; the Phase 1c ensemble is static).");
+    int inner_seed = pt0.get<int>("inner_seed", 777);
     pt1.put("inner_nwalkers", inner_nwalkers);
+    pt1.put("inner_nsteps", inner_nsteps);
+    pt1.put("inner_seed", inner_seed);
+    if (auto prop_pt = pt0.get_child_optional("inner_propagator"))
+      pt1.put_child("inner_propagator", *prop_pt);
     std::unordered_set<std::string> pass_through_keys = {
         "system",
         "name",
@@ -101,6 +123,9 @@ public:
         "filename",
         "stochastic",
         "inner_nwalkers",
+        "inner_nsteps",
+        "inner_seed",
+        "inner_propagator",
     };
     io::compare_known_keys("Stochastic trial wavefunction (StochasticWfn)", pt1, pt0, pass_through_keys);
     return pt1;
@@ -119,6 +144,7 @@ public:
 
   bool inner_walkers_initialized() const { return inner_ensemble_.initialized; }
   int inner_nwalkers() const { return inner_nwalkers_; }
+  int inner_nsteps() const { return inner_nsteps_; }
 
   WalkerSet& inner_wset();
   WalkerSet const& inner_wset() const;

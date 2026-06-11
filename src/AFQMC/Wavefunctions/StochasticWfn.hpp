@@ -82,6 +82,10 @@ struct StochasticInnerStack
 template<bool MP, class devPsiT>
 class StochasticWfn : public AFQMCInfo
 {
+  // Buffer manager for transient overlap work vectors (mirrors NOMSD).
+  using buffer_alloc_type = DeviceBufferManager::template allocator_t<ComplexType>;
+  using StaticVector      = boost::multi::static_array<ComplexType, 1, buffer_alloc_type>;
+
   struct StochasticInnerEnsemble
   {
     std::unique_ptr<WalkerSet> wset;
@@ -93,6 +97,7 @@ class StochasticWfn : public AFQMCInfo
   StochasticInnerEnsemble inner_ensemble_;
   int inner_nwalkers_{1};
   int inner_nsteps_{0};
+  DeviceBufferManager buffer_manager;
   NOMSD<MP, devPsiT> nomsd_;
   std::unique_ptr<StochasticInnerStack<MP, devPsiT>> inner_stack_;
 
@@ -116,6 +121,7 @@ public:
                 [[maybe_unused]] int targetNW = 1)
       : AFQMCInfo(info),
         TG_(tg_),
+        buffer_manager(),
         nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(outer_sdet_), std::move(outer_hop_), std::move(ci_),
                std::move(orbs_), wlk, nce, targetNW),
         inner_stack_(std::move(inner_stack_in))

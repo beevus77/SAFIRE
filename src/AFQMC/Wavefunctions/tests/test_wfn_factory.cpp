@@ -908,6 +908,70 @@ void stochastic_inner_propagator_construction(boost::mpi3::communicator& world)
   ctx.TG.Global().barrier();
 }
 
+// Phase 2: the overridden StochasticWfn::Overlap reduces the inner ensemble into an
+// effective trial overlap (Eq. 24 of arXiv:2505.18519, static-ensemble limit). Verifies:
+//   (1) inner_nwalkers invariance -- a static replicated ensemble (inner_nsteps = 0) gives
+//       overlaps independent of inner_nwalkers;
+//   (2) delegate limit -- for a single-determinant trial the stochastic overlap equals the
+//       NOMSD overlap exactly. Multi-determinant trials (e.g. wfn_msd.h5) intentionally
+//       diverge -- a single-determinant inner ensemble cannot reproduce the CI-weighted
+//       NOMSD overlap -- so that assertion is gated on ndet == 1.
+// Overlap is read WITHOUT a following Energy call: NOMSD::Energy(wset) overwrites the OVLP
+// property and would otherwise mask the override.
+template<bool MP, class Allocator>
+void stochastic_overlap_matches_nomsd(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_HAMIL) || not file_exists(UTEST_WFN))
+    APP_ABORT(" Hamiltonian or wavefunction file not found. Run unit test with --hamil /path/to/hamil.h5 and --wfn /path/to/wfn.h5.");
+  if (afqmc::getWavefunctionType(UTEST_WFN) != "NOMSD")
+    return;
+
+  WfnTestContext<MP, Allocator> ctx(world);
+  Wavefunction& wfn_nomsd =
+      ctx.register_wavefunction("wfn_nomsd_ov", ctx.make_wfn_pt("wfn_nomsd_ov", UTEST_WFN, false));
+  Wavefunction& wfn_s1 =
+      ctx.register_wavefunction("wfn_stoch_ov1", ctx.make_wfn_pt("wfn_stoch_ov1", UTEST_WFN, true, 1));
+  Wavefunction& wfn_s3 =
+      ctx.register_wavefunction("wfn_stoch_ov3", ctx.make_wfn_pt("wfn_stoch_ov3", UTEST_WFN, true, 3));
+
+  auto collect_overlaps = [&](Wavefunction& wfn, const std::string& guess_id) {
+    WalkerSet wset = ctx.make_walker_set();
+    ctx.init_walkers(wset, guess_id);
+    wfn.Overlap(wset);
+    ctx.TG.TG_local().barrier();
+    std::vector<ComplexType> ov;
+    for (auto it = wset.begin(); it != wset.end(); ++it)
+      ov.push_back(ComplexType(*it->overlap()));
+    return ov;
+  };
+
+  std::vector<ComplexType> ov_ref = collect_overlaps(wfn_nomsd, "wfn_nomsd_ov");
+  std::vector<ComplexType> ov_s1  = collect_overlaps(wfn_s1, "wfn_nomsd_ov");
+  std::vector<ComplexType> ov_s3  = collect_overlaps(wfn_s3, "wfn_nomsd_ov");
+
+  REQUIRE(ov_s1.size() == ov_ref.size());
+  REQUIRE(ov_s3.size() == ov_ref.size());
+
+  // (1) inner_nwalkers invariance: a static replicated ensemble gives identical overlaps.
+  for (int n = 0; n < static_cast<int>(ov_s1.size()); ++n)
+  {
+    REQUIRE(real(ov_s3[n]) == Approx(real(ov_s1[n])));
+    REQUIRE(imag(ov_s3[n]) == Approx(imag(ov_s1[n])));
+  }
+
+  // (2) delegate limit: single-determinant trial => stochastic overlap == NOMSD overlap.
+  if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
+  {
+    for (int n = 0; n < static_cast<int>(ov_s1.size()); ++n)
+    {
+      REQUIRE(real(ov_s1[n]) == Approx(real(ov_ref[n])));
+      REQUIRE(imag(ov_s1[n]) == Approx(imag(ov_ref[n])));
+    }
+  }
+
+  ctx.TG.Global().barrier();
+}
+
 template<bool MP, class Allocator>
 void wfn_fac_distributed(boost::mpi3::communicator& world, int ngroups)
 {
@@ -1602,6 +1666,25 @@ TEST_CASE("stochastic_inner_propagator_construction", "[wavefunction_factory][st
 
   stochastic_inner_propagator_construction<false, Alloc>(world);
   stochastic_inner_propagator_construction<true, Alloc>(world);
+  release_memory_managers();
+}
+
+TEST_CASE("stochastic_overlap_matches_nomsd", "[wavefunction_factory][stochastic_wfn]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto node  = world.split_shared(world.rank());
+  setup_loggers(world.root(), 2, 2);
+
+#if defined(ENABLE_DEVICE)
+  arch::INIT(node);
+  using Alloc = device::device_allocator<ComplexType>;
+#else
+  using Alloc = shared_allocator<ComplexType>;
+#endif
+  setup_memory_managers(node, 10uL * 1024uL * 1024uL);
+
+  stochastic_overlap_matches_nomsd<false, Alloc>(world);
+  stochastic_overlap_matches_nomsd<true, Alloc>(world);
   release_memory_managers();
 }
 

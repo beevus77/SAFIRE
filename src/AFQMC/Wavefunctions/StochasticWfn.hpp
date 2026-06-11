@@ -82,6 +82,10 @@ struct StochasticInnerStack
 template<bool MP, class devPsiT>
 class StochasticWfn : public AFQMCInfo
 {
+  // Buffer manager for transient overlap work vectors (mirrors NOMSD).
+  using buffer_alloc_type = DeviceBufferManager::template allocator_t<ComplexType>;
+  using StaticVector      = boost::multi::static_array<ComplexType, 1, buffer_alloc_type>;
+
   struct StochasticInnerEnsemble
   {
     std::unique_ptr<WalkerSet> wset;
@@ -93,6 +97,7 @@ class StochasticWfn : public AFQMCInfo
   StochasticInnerEnsemble inner_ensemble_;
   int inner_nwalkers_{1};
   int inner_nsteps_{0};
+  DeviceBufferManager buffer_manager;
   NOMSD<MP, devPsiT> nomsd_;
   std::unique_ptr<StochasticInnerStack<MP, devPsiT>> inner_stack_;
 
@@ -116,6 +121,7 @@ public:
                 [[maybe_unused]] int targetNW = 1)
       : AFQMCInfo(info),
         TG_(tg_),
+        buffer_manager(),
         nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(outer_sdet_), std::move(outer_hop_), std::move(ci_),
                std::move(orbs_), wlk, nce, targetNW),
         inner_stack_(std::move(inner_stack_in))
@@ -306,17 +312,18 @@ public:
     nomsd_.MixedDensityMatrix_for_vbias(wset, std::forward<MatG>(G));
   }
 
+  // Phase 2a: stochastic trial overlap. Reduces the inner ensemble {psi_p} into an
+  // effective overlap per outer walker, Ov[w] = (1/P) sum_p <psi_p | phi_w>, following
+  // Eq. 24 of arXiv:2505.18519 in the static-ensemble limit (inner_nsteps = 0, where
+  // B_T = 1 so the phase factor / importance reweighting are degenerate). At the
+  // single-determinant delegate limit this equals the NOMSD overlap exactly. The
+  // phase/importance-sampling (Eq. 25-26) and inner-propagation leapfrog arrive in
+  // Phase 3 (propagator hot path), not here. Definitions in StochasticWfn.icc.
   template<class WlkSet, class TVec>
-  void Overlap(const WlkSet& wset, TVec&& Ov)
-  {
-    nomsd_.Overlap(wset, std::forward<TVec>(Ov));
-  }
+  void Overlap(const WlkSet& wset, TVec&& Ov);
 
   template<class WlkSet>
-  void Overlap(WlkSet& wset)
-  {
-    nomsd_.Overlap(wset);
-  }
+  void Overlap(WlkSet& wset);
 
   template<class... Args>
   void accumulate_estimators(Args&&... args)

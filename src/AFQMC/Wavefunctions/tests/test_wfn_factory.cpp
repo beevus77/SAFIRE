@@ -41,6 +41,7 @@
 #include "AFQMC/Hamiltonians/Hamiltonian.hpp"
 #include "AFQMC/Wavefunctions/WavefunctionFactory.h"
 #include "AFQMC/Walkers/WalkerSet.hpp"
+#include "AFQMC/Propagators/Propagator.hpp"
 
 #include "SparseMatrix/csr_matrix_construct.hpp"
 #include "Numerics/ma_blas.hpp"
@@ -862,6 +863,51 @@ void stochastic_inner_walkers_uninitialized_smoke(boost::mpi3::communicator& wor
   ctx.TG.Global().barrier();
 }
 
+// Phase 1c: the factory builds an inner Propagator bound to the inner NOMSD (wrapped in
+// a heap-allocated Wavefunction) at wavefunction-build time. With inner_nsteps = 0 the
+// propagator is dormant; this only verifies the wiring.
+template<bool MP, class Allocator>
+void stochastic_inner_propagator_construction(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_HAMIL) || not file_exists(UTEST_WFN))
+    APP_ABORT(" Hamiltonian or wavefunction file not found. Run unit test with --hamil /path/to/hamil.h5 and --wfn /path/to/wfn.h5.");
+  if (afqmc::getWavefunctionType(UTEST_WFN) != "NOMSD")
+    return;
+
+  WfnTestContext<MP, Allocator> ctx(world);
+  Wavefunction& wfn =
+      ctx.register_wavefunction("wfn_stoch_prop", ctx.make_wfn_pt("wfn_stoch_prop", UTEST_WFN, true, 3));
+
+  REQUIRE(wfn.is_stochastic_wavefunction());
+
+  boost::apply_visitor(
+      [&](auto&& a) {
+        using Wfn = std::decay_t<decltype(a)>;
+        if constexpr (wavefunction_detail::is_stochastic_wfn<Wfn>::value)
+        {
+          REQUIRE(a.inner_nsteps() == 0);
+          REQUIRE(a.inner_propagator_built());
+
+          // The inner Wavefunction wrapper holds the same NOMSD object the typed
+          // accessor returns (pointer identity through SlaterDetOperations).
+          Wavefunction& inner_wfn = a.inner_wavefunction();
+          REQUIRE(inner_wfn.getSlaterDetOperations() == a.inner_nomsd().getSlaterDetOperations());
+          REQUIRE(inner_wfn.getSlaterDetOperations() != a.outer_nomsd().getSlaterDetOperations());
+          require_nomsd_layout_parity(a.inner_nomsd(), inner_wfn);
+
+          // The propagator is bound to the inner wavefunction's Hamiltonian layout and
+          // carries default propagation settings.
+          Propagator& prop = a.inner_propagator();
+          REQUIRE(prop.global_number_of_cholesky_vectors() == a.inner_nomsd().global_number_of_cholesky_vectors());
+          REQUIRE(prop.hybrid_propagation());
+          REQUIRE(not prop.free_propagation());
+        }
+      },
+      wfn);
+
+  ctx.TG.Global().barrier();
+}
+
 template<bool MP, class Allocator>
 void wfn_fac_distributed(boost::mpi3::communicator& world, int ngroups)
 {
@@ -1537,6 +1583,25 @@ TEST_CASE("stochastic_inner_walkers_uninitialized_smoke", "[wavefunction_factory
 
   stochastic_inner_walkers_uninitialized_smoke<false, Alloc>(world);
   stochastic_inner_walkers_uninitialized_smoke<true, Alloc>(world);
+  release_memory_managers();
+}
+
+TEST_CASE("stochastic_inner_propagator_construction", "[wavefunction_factory][stochastic_wfn]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto node  = world.split_shared(world.rank());
+  setup_loggers(world.root(), 2, 2);
+
+#if defined(ENABLE_DEVICE)
+  arch::INIT(node);
+  using Alloc = device::device_allocator<ComplexType>;
+#else
+  using Alloc = shared_allocator<ComplexType>;
+#endif
+  setup_memory_managers(node, 10uL * 1024uL * 1024uL);
+
+  stochastic_inner_propagator_construction<false, Alloc>(world);
+  stochastic_inner_propagator_construction<true, Alloc>(world);
   release_memory_managers();
 }
 

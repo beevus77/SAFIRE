@@ -62,8 +62,13 @@ public:
     int inner_nwalkers = pt0.get<int>("inner_nwalkers", 1);
     if (inner_nwalkers < 1)
       APP_ABORT("Error in WavefunctionFactory::interpret_inputs: inner_nwalkers must be >= 1.");
-    if (not stochastic && pt0.get_child_optional("inner_nwalkers"))
-      APP_ABORT("Error in WavefunctionFactory::interpret_inputs: inner_nwalkers requires stochastic: true.");
+    int inner_nsteps = pt0.get<int>("inner_nsteps", 0);
+    int inner_seed   = pt0.get<int>("inner_seed", 777);
+    auto inner_propagator_block = pt0.get_child_optional("inner_propagator");
+    for (auto const& key : {"inner_nwalkers", "inner_nsteps", "inner_seed", "inner_propagator"})
+      if (not stochastic && pt0.get_child_optional(key))
+        APP_ABORT("Error in WavefunctionFactory::interpret_inputs: " + std::string(key) +
+                  " requires stochastic: true.");
     // validate inputs
     // create verbose internal inputs
     ptree pt1;
@@ -75,8 +80,14 @@ public:
     pt1.put("ndets_to_read", ndets_to_read);
     pt1.put("stochastic", stochastic);
     if (stochastic)
+    {
       pt1.put("inner_nwalkers", inner_nwalkers);
-    // optional parameters 
+      pt1.put("inner_nsteps", inner_nsteps);
+      pt1.put("inner_seed", inner_seed);
+      if (inner_propagator_block)
+        pt1.put_child("inner_propagator", *inner_propagator_block);
+    }
+    // optional parameters
     if( auto val = pt0.get_optional<int>("algorithm") )
       pt1.put("algorithm", *val);
     // set default later, since it depends on HamiltonianOperations type
@@ -86,6 +97,9 @@ public:
         "system",
         "stochastic",
         "inner_nwalkers",
+        "inner_nsteps",
+        "inner_seed",
+        "inner_propagator",
     };
     io::compare_known_keys("Wavefunction Factory",pt1, pt0,pass_through_keys);
     return pt1;
@@ -285,9 +299,7 @@ protected:
 
   static ptree strip_stochastic_factory_keys(ptree pt)
   {
-    pt.erase("stochastic");
-    pt.erase("inner_nwalkers");
-    return pt;
+    return strip_stochastic_input_keys(std::move(pt));
   }
 
   template<bool MP, class MType, class... Rest>
@@ -343,6 +355,24 @@ protected:
     return cloned;
   }
 
+  // Assembles the inner stack of a StochasticWfn: inner NOMSD wrapped in a heap-allocated
+  // Wavefunction, the inner Propagator built against it via PropagatorFactory, and the
+  // device RNG the propagator samples. Defined in WavefunctionFactory.cpp (the only TU
+  // that instantiates it, via buildStochasticNomsdWavefunction below) so that this header
+  // does not need Propagator.hpp.
+  template<bool MP, class MType, class OrbsContainer>
+  std::unique_ptr<StochasticInnerStack<MP, MType>> buildStochasticInnerStack(AFQMCInfo& info,
+                                                                             ptree const& pt,
+                                                                             TaskGroup_& TGprop,
+                                                                             TaskGroup_& TGwfn,
+                                                                             SlaterDetOperations&& inner_sdet,
+                                                                             HamiltonianOperations<MP>&& inner_hop,
+                                                                             std::vector<ComplexType>&& inner_ci,
+                                                                             OrbsContainer&& inner_orbs,
+                                                                             WALKER_TYPES walker_type,
+                                                                             ComplexType NCE,
+                                                                             int targetNW);
+
   template<bool MP, class MType, class OrbsContainer>
   Wavefunction buildStochasticNomsdWavefunction(AFQMCInfo& info,
                                                 ptree pt,
@@ -364,11 +394,13 @@ protected:
     auto hops      = makeOuterInnerHamOps<MP>(restart_file, walker_type, NMO, NAEA, NAEB, PsiT, TGprop, TGwfn, h);
     auto inner_ci  = clone_orbitals(ci);
     auto inner_orbs = clone_orbitals(orbs);
+    auto inner_stack = buildStochasticInnerStack<MP, MType>(info, pt, TGprop, TGwfn, std::move(sdets.inner),
+                                                            std::move(hops.inner), std::move(inner_ci),
+                                                            std::move(inner_orbs), walker_type, NCE, targetNW);
     TGwfn.Node().barrier();
-    return Wavefunction(StochasticWfn<MP, MType>(
-        info, std::move(pt), TGwfn, std::move(sdets.outer), std::move(hops.outer), std::move(sdets.inner),
-        std::move(hops.inner), std::move(ci), std::move(orbs), std::move(inner_ci), std::move(inner_orbs), walker_type,
-        NCE, targetNW));
+    return Wavefunction(StochasticWfn<MP, MType>(info, std::move(pt), TGwfn, std::move(sdets.outer),
+                                                 std::move(hops.outer), std::move(ci), std::move(orbs),
+                                                 std::move(inner_stack), walker_type, NCE, targetNW));
   }
 
   template<class MType, class OrbsContainer>

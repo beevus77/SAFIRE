@@ -29,10 +29,55 @@ namespace sfqmc
 {
 namespace afqmc
 {
+// Forward declarations: StochasticWfn is itself an alternative of the Wavefunction
+// boost::variant (Wavefunction.hpp includes this header), and Propagator.hpp includes
+// Wavefunction.hpp, so neither type can be complete here. The inner stack holds them
+// behind the StochasticInnerStack interface below; the concrete implementation lives in
+// WavefunctionFactory.cpp where both types are complete.
+class Wavefunction;
+class Propagator;
+
+/*
+ * Strips all StochasticWfn-specific keys from a wavefunction input block, leaving a
+ * plain-NOMSD input. Single source of truth for the stochastic key set; used by
+ * StochasticWfn::nomsd_inputs and WavefunctionFactory::strip_stochastic_factory_keys.
+ */
+inline ptree strip_stochastic_input_keys(ptree pt)
+{
+  for (auto const& key : {"stochastic", "inner_nwalkers", "inner_nsteps", "inner_seed", "inner_propagator"})
+    pt.erase(key);
+  return pt;
+}
+
+/*
+ * Owner of the inner AFQMC stack of a StochasticWfn: the inner NOMSD (held inside a
+ * heap-allocated Wavefunction variant so propagators can bind a stable Wavefunction&),
+ * the inner Propagator, and the device RNG the propagator samples from.
+ * Heap allocation matters: StochasticWfn is moved into the Wavefunction variant after
+ * construction, and the inner Propagator stores references to the inner Wavefunction
+ * and RNG — those must not move with it.
+ */
+template<bool MP, class devPsiT>
+struct StochasticInnerStack
+{
+  virtual ~StochasticInnerStack() = default;
+
+  virtual NOMSD<MP, devPsiT>& nomsd()             = 0;
+  virtual NOMSD<MP, devPsiT> const& nomsd() const = 0;
+
+  virtual Wavefunction& wavefunction()             = 0;
+  virtual Wavefunction const& wavefunction() const = 0;
+
+  virtual bool has_propagator() const         = 0;
+  virtual Propagator& propagator()             = 0;
+  virtual Propagator const& propagator() const = 0;
+};
+
 /*
  * Stochastic trial wavefunction wrapper.
- * Owns an outer NOMSD delegate (nomsd_) for outer-walker-facing operations and a
- * separate inner NOMSD (inner_nomsd_) with its own HamOps/SDetOp for the inner ensemble.
+ * Owns an outer NOMSD delegate (nomsd_) for outer-walker-facing operations and an inner
+ * stack (inner_stack_) holding the inner NOMSD — with its own HamOps/SDetOp — wrapped in
+ * a Wavefunction, plus the inner Propagator (Phase 1c; static ensemble, inner_nsteps = 0).
  */
 template<bool MP, class devPsiT>
 class StochasticWfn : public AFQMCInfo
@@ -47,15 +92,13 @@ class StochasticWfn : public AFQMCInfo
   afqmc::TaskGroup_& TG_;
   StochasticInnerEnsemble inner_ensemble_;
   int inner_nwalkers_{1};
+  int inner_nsteps_{0};
   NOMSD<MP, devPsiT> nomsd_;
-  NOMSD<MP, devPsiT> inner_nomsd_;
+  std::unique_ptr<StochasticInnerStack<MP, devPsiT>> inner_stack_;
 
   static ptree nomsd_inputs(ptree const& pt0)
   {
-    ptree pt_nomsd_in = pt0;
-    pt_nomsd_in.erase("stochastic");
-    pt_nomsd_in.erase("inner_nwalkers");
-    return NOMSD<MP, devPsiT>::interpret_inputs(pt_nomsd_in);
+    return NOMSD<MP, devPsiT>::interpret_inputs(strip_stochastic_input_keys(pt0));
   }
 
 public:
@@ -65,12 +108,9 @@ public:
                 afqmc::TaskGroup_& tg_,
                 SlaterDetOperations&& outer_sdet_,
                 HamiltonianOperations<MP>&& outer_hop_,
-                SlaterDetOperations&& inner_sdet_,
-                HamiltonianOperations<MP>&& inner_hop_,
                 std::vector<ComplexType>&& ci_,
                 std::vector<MType>&& orbs_,
-                std::vector<ComplexType>&& inner_ci_,
-                std::vector<MType>&& inner_orbs_,
+                std::unique_ptr<StochasticInnerStack<MP, devPsiT>>&& inner_stack_in,
                 WALKER_TYPES wlk,
                 ComplexType nce,
                 [[maybe_unused]] int targetNW = 1)
@@ -78,11 +118,13 @@ public:
         TG_(tg_),
         nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(outer_sdet_), std::move(outer_hop_), std::move(ci_),
                std::move(orbs_), wlk, nce, targetNW),
-        inner_nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(inner_sdet_), std::move(inner_hop_),
-                     std::move(inner_ci_), std::move(inner_orbs_), wlk, nce, targetNW)
+        inner_stack_(std::move(inner_stack_in))
   {
+    if (inner_stack_ == nullptr)
+      APP_ABORT("Error in StochasticWfn: inner stack must be provided (see WavefunctionFactory).");
     ptree pt = interpret_inputs(pt_in);
     inner_nwalkers_ = pt.get<int>("inner_nwalkers");
+    inner_nsteps_   = pt.get<int>("inner_nsteps");
     app_log(2, "\nStochasticWfn input:\n{}\n", io::to_string(pt));
   }
 
@@ -92,7 +134,18 @@ public:
     int inner_nwalkers = pt0.get<int>("inner_nwalkers", 1);
     if (inner_nwalkers < 1)
       APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nwalkers must be >= 1.");
+    int inner_nsteps = pt0.get<int>("inner_nsteps", 0);
+    if (inner_nsteps < 0)
+      APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps must be >= 0.");
+    if (inner_nsteps > 0)
+      APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps > 0 not yet supported "
+                "(inner propagation arrives with Phase 2+; the Phase 1c ensemble is static).");
+    int inner_seed = pt0.get<int>("inner_seed", 777);
     pt1.put("inner_nwalkers", inner_nwalkers);
+    pt1.put("inner_nsteps", inner_nsteps);
+    pt1.put("inner_seed", inner_seed);
+    if (auto prop_pt = pt0.get_child_optional("inner_propagator"))
+      pt1.put_child("inner_propagator", *prop_pt);
     std::unordered_set<std::string> pass_through_keys = {
         "system",
         "name",
@@ -101,6 +154,9 @@ public:
         "filename",
         "stochastic",
         "inner_nwalkers",
+        "inner_nsteps",
+        "inner_seed",
+        "inner_propagator",
     };
     io::compare_known_keys("Stochastic trial wavefunction (StochasticWfn)", pt1, pt0, pass_through_keys);
     return pt1;
@@ -119,15 +175,24 @@ public:
 
   bool inner_walkers_initialized() const { return inner_ensemble_.initialized; }
   int inner_nwalkers() const { return inner_nwalkers_; }
+  int inner_nsteps() const { return inner_nsteps_; }
 
   WalkerSet& inner_wset();
   WalkerSet const& inner_wset() const;
 
-  NOMSD<MP, devPsiT>& inner_wfn() { return inner_nomsd_; }
-  NOMSD<MP, devPsiT> const& inner_wfn() const { return inner_nomsd_; }
+  NOMSD<MP, devPsiT>& inner_wfn() { return inner_stack_->nomsd(); }
+  NOMSD<MP, devPsiT> const& inner_wfn() const { return inner_stack_->nomsd(); }
 
-  NOMSD<MP, devPsiT>& inner_nomsd() { return inner_nomsd_; }
-  NOMSD<MP, devPsiT> const& inner_nomsd() const { return inner_nomsd_; }
+  NOMSD<MP, devPsiT>& inner_nomsd() { return inner_stack_->nomsd(); }
+  NOMSD<MP, devPsiT> const& inner_nomsd() const { return inner_stack_->nomsd(); }
+
+  // Inner NOMSD wrapped as a Wavefunction (the object the inner Propagator is bound to).
+  Wavefunction& inner_wavefunction() { return inner_stack_->wavefunction(); }
+  Wavefunction const& inner_wavefunction() const { return inner_stack_->wavefunction(); }
+
+  bool inner_propagator_built() const { return inner_stack_->has_propagator(); }
+  Propagator& inner_propagator();
+  Propagator const& inner_propagator() const;
 
   NOMSD<MP, devPsiT>& outer_nomsd() { return nomsd_; }
   NOMSD<MP, devPsiT> const& outer_nomsd() const { return nomsd_; }

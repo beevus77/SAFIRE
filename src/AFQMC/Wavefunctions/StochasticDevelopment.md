@@ -204,6 +204,144 @@ test exercises `Overlap` in isolation and gates the NOMSD-equality assertion on 
 
 ---
 
+## Estimator Definitions
+
+Every override in Phases 2–6 computes the same kind of object: a **mixed expectation value** of an
+operator `Ô` between the stochastic trial `⟨Ψ_T|` and an outer walker `|φ_w⟩`. This section fixes
+notation and writes each estimator we will need — overlap, local energy, mixed density matrix, force
+bias — as one specialization of Eq. 27 of [arXiv:2505.18519](https://arxiv.org/abs/2505.18519), so the
+later phases differ only in the choice of `Ô`. Equation numbers below refer to that paper.
+
+### The one ansatz
+
+```
+|Ψ_T⟩ = ∫ dY  p_T(Y)  B̂_T(Y) |φ_T⟩                         (Eq. 21)
+```
+
+`|φ_T⟩` is a single Slater determinant (the *anchor*; `|Ψ_T⁰⟩` in the paper, taken as one determinant),
+`B̂_T(Y) = exp(one-body)` is an exponential one-body operator built from auxiliary fields `Y`, and
+`p_T(Y)` is the Hubbard–Stratonovich Gaussian weight. By Thouless' theorem each field path `Y^[p]`
+(`p = 1 … P`) generates a single inner-walker determinant, written here through its bra:
+
+```
+⟨ψ_p|  ≡  ⟨φ_T| B̂_T(Y^[p])                                 (one Slater determinant)
+```
+
+In code `ψ_p` is `inner_wset()[p]` and `φ_w` is the outer driver walker `wset[w]`. Define the per-sample
+overlap and its phase (Eq. 26):
+
+```
+O_p(φ_w)  ≡  ⟨ψ_p | φ_w⟩
+S_p(φ_w)  ≡  O_p(φ_w) / |O_p(φ_w)|                          (Eq. 26)
+```
+
+### The master estimator (Eq. 27)
+
+For any operator `Ô`, the stochastic-trial mixed estimator on outer walker `w` is the phase-weighted
+average over the inner ensemble of an ordinary **per-pair local estimate**:
+
+```
+                  ⟨Ψ_T|Ô|φ_w⟩       Σ_p  ⟨Ô⟩_{p,w} · S_p(φ_w)
+   ⟨Ô⟩_w   ≡   ───────────────  =  ─────────────────────────         (Eq. 27)
+                  ⟨Ψ_T|φ_w⟩              Σ_p  S_p(φ_w)
+
+   ⟨Ô⟩_{p,w}  ≡  ⟨ψ_p|Ô|φ_w⟩ / ⟨ψ_p|φ_w⟩
+```
+
+`⟨Ô⟩_{p,w}` is exactly the single-determinant (Wick / Slater–Condon) local estimate of `Ô` between the
+inner determinant `ψ_p` and the outer walker `φ_w` — the same per-determinant-pair quantity `NOMSD`
+already forms against a fixed trial. The stochastic trial only adds the phase-weighted average
+`Σ_p (·) S_p / Σ_p S_p`. **Each estimator below is Eq. 27 with a different `Ô`** (the overlap is the
+lone exception — it is the normalization, not a ratio of this form).
+
+### The four estimators
+
+| Estimator | `Ô` | Per-pair local estimate `⟨Ô⟩_{p,w}` | SAFIRE method | Phase |
+|-----------|-----|--------------------------------------|---------------|-------|
+| Overlap | `𝟙` | (absolute normalization; see below) | `Overlap` | 2a ✓ |
+| Local energy | `Ĥ` | `E_{p,w} = ⟨ψ_p\|Ĥ\|φ_w⟩ / ⟨ψ_p\|φ_w⟩` | `Energy` | 2b |
+| Mixed density matrix | `c†_i c_j` | `(G_{p,w})_{ij} = ⟨ψ_p\|c†_i c_j\|φ_w⟩ / ⟨ψ_p\|φ_w⟩` | `MixedDensityMatrix[_for_vbias]` | 3 |
+| Force bias | `L̂_γ` | `Σ_{ij} (L_γ)_{ij} (G_{p,w})_{ij}` | `vbias` | 3 |
+
+**1 — Overlap (`Ô = 𝟙`).** Not a ratio of the Eq. 27 form; it is the *absolute* bra normalization
+(Eq. 24):
+
+```
+⟨Ψ_T|φ_w⟩ = (𝒩(φ_w)/P) Σ_p S_p(φ_w),     𝒩(φ_w) = ∫ dY |⟨φ_T| p_T(Y) B̂_T(Y) |φ_w⟩|   (Eq. 24)
+```
+
+What the random walk consumes is never this absolute value but the step-to-step **ratio**
+`⟨Ψ_T|φ'⟩/⟨Ψ_T|φ⟩` (Eq. 25), in which `𝒩(φ_w)` cancels — see
+[Stochastic overlap (Phase 2a)](#stochastic-overlap-phase-2a). Phase 2a stores the static-limit
+absolute overlap; the phase weights `S_p` and the `𝒩` cancellation are Phase 3.
+
+**2 — Local energy (`Ô = Ĥ`).** Eq. 27 with the Hamiltonian; this is the per-walker term of the AFQMC
+mixed-energy estimator (Eq. 16):
+
+```
+E_L[w] = Σ_p E_{p,w} S_p(φ_w) / Σ_p S_p(φ_w),     E_{p,w} = ⟨ψ_p|Ĥ|φ_w⟩ / ⟨ψ_p|φ_w⟩
+```
+
+`E_{p,w}` decomposes into the one-body (`E1`) and two-body Coulomb / exchange (`EJ` / `EXX`) pieces
+exactly as `NOMSD::Energy` does today, each built from the per-pair Green's function `G_{p,w}` of
+estimator 3. This is Phase 2b.
+
+**3 — Mixed density matrix / one-particle Green's function (`Ô = c†_i c_j`).**
+
+```
+G_{ij}[w] = Σ_p (G_{p,w})_{ij} S_p(φ_w) / Σ_p S_p(φ_w),
+(G_{p,w})_{ij} = ⟨ψ_p|c†_i c_j|φ_w⟩ / ⟨ψ_p|φ_w⟩
+```
+
+`G_{p,w}` is the standard single-pair mixed Green's function (`SDetOp.MixedDensityMatrix` between `ψ_p`
+and `φ_w`). It is the shared ingredient of both the local energy (2) and the force bias (4). Phase 3.
+
+**4 — Force bias (`Ô = L̂_γ`).** The `L̂_γ = Σ_{ij} (L_γ)_{ij} c†_i c_j` are the one-body Cholesky / HS
+operators (`V̂ = -½ Σ_γ L̂_γ²`). Being one-body, the force bias is just the Cholesky contraction of the
+mixed DM; the auxiliary-field shift is (Eq. 15)
+
+```
+x̄_γ[w] = -√Δτ · ⟨Ψ_T|L̂_γ|φ_w⟩ / ⟨Ψ_T|φ_w⟩ = -√Δτ · Σ_{ij} (L_γ)_{ij} G_{ij}[w]        (Eq. 15)
+```
+
+so SAFIRE's `vbias` computes the determinant-dependent factor `⟨Ψ_T|L̂_γ|φ_w⟩/⟨Ψ_T|φ_w⟩ = L · G[w]`
+exactly as in deterministic AFQMC, but with the stochastic `G[w]` of estimator 3 (the propagator
+applies the `√Δτ` / timestep prefactor). Phase 3 (`MixedDensityMatrix_for_vbias` → `vbias`).
+
+### Static-ensemble limit (`inner_nsteps = 0`, `B̂_T = 𝟙`)
+
+All `ψ_p` collapse to the anchor `φ_T`, the phase weights `S_p` become identical, and Eq. 27 reduces to
+the single deterministic estimate against `φ_T`:
+
+| Estimator | Static-limit value |
+|-----------|--------------------|
+| Overlap | `⟨φ_T\|φ_w⟩` |
+| Local energy | `⟨φ_T\|Ĥ\|φ_w⟩ / ⟨φ_T\|φ_w⟩` |
+| Mixed DM | `⟨φ_T\|c†_i c_j\|φ_w⟩ / ⟨φ_T\|φ_w⟩` |
+| Force bias | `L · G` |
+
+For a **single-determinant** anchor (`φ_T = Psi0`) these are precisely the plain-`NOMSD` estimates — the
+delegate-limit regression each phase must reproduce. A multi-determinant `NOMSD` trial is *not* recovered
+by a single-determinant anchor (see
+[Delegate limit and the multi-determinant caveat](#delegate-limit-and-the-multi-determinant-caveat)).
+
+### Walker-conditioned sampling (the Phase 3 coupling)
+
+Away from the static limit the inner field paths are importance-sampled **conditioned on the outer
+walker** (Eq. 23):
+
+```
+𝒫(Y; φ_w) = |⟨φ_T| p_T(Y) B̂_T(Y) |φ_w⟩| / 𝒩(φ_w)
+```
+
+so both the inner ensemble `{ψ_p}` and the phase weights `S_p(φ_w)` depend on `φ_w`. This walker coupling
+— together with the propagate-then-resample *leapfrog* that makes the `𝒩(φ_w)` cancellation in the
+Eq. 25 ratio exact — is what Phase 3 adds. Phases 2a/2b implement the `B̂_T = 𝟙` static limit, where the
+ensemble is walker-independent, `S_p` is degenerate, and Eq. 27 collapses to the plain `(1/P) Σ_p`
+average used by `Overlap` today.
+
+---
+
 ## Stochastic local energy (Phase 2b — planned)
 
 Phase 2b overrides `Energy(wset)` / `Energy(wset, E, Ov)` to return a **stochastic local

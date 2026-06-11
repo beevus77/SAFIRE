@@ -14,6 +14,8 @@
 // and LICENSES/NCSA.txt for details.
 ////////////////////////////////////////////////////////////////////////////////
 
+#include "Utilities/FairDivide.hpp"
+
 namespace sfqmc
 {
 namespace afqmc
@@ -66,6 +68,80 @@ Propagator const& StochasticWfn<MP, devPsiT>::inner_propagator() const
   if (not inner_stack_->has_propagator())
     APP_ABORT("Error in StochasticWfn::inner_propagator: inner propagator not built.");
   return inner_stack_->propagator();
+}
+
+/*
+ * Stochastic trial overlap (Phase 2, static-ensemble limit). For each outer walker phi_w
+ * we reduce the inner ensemble {psi_p} (p = 0..P-1) into an effective overlap
+ *   Ov[w] = (1/P) sum_p <psi_p | phi_w>,
+ * the inner_nsteps = 0 specialization of Eq. 24 of arXiv:2505.18519 (B_T = 1, so the phase
+ * factor S(Y) and importance reweighting of Eq. 25-26 are degenerate and reduce to a plain
+ * average; those arrive with the inner-propagation leapfrog in Phase 3). Each <psi_p|phi_w>
+ * is a single-determinant overlap between the inner-walker and outer-walker Slater matrices,
+ * evaluated with herm = false (so SlaterDetOperations forms det(psi_p^dagger phi_w)) and with
+ * the same LogOverlapFactor as NOMSD::Overlap, so the single-determinant delegate limit
+ * (inner ensemble == trial determinant) reproduces the NOMSD overlap exactly.
+ */
+template<bool MP, class devPsiT>
+template<class WlkSet, class TVec>
+void StochasticWfn<MP, devPsiT>::Overlap(const WlkSet& wset, TVec&& Ov)
+{
+  using std::fill_n;
+  if (not inner_ensemble_.initialized || inner_ensemble_.wset == nullptr)
+    APP_ABORT("Error in StochasticWfn::Overlap: inner walkers not initialized "
+              "(call maybe_initialize_stochastic_inner_walkers first).");
+  WalkerSet& inner = *inner_ensemble_.wset;
+  const int nw     = wset.size();
+  const int P      = inner.size();
+  RUNTIME_CHECK(Ov.size() >= nw, "");
+  RUNTIME_CHECK(P >= 1, "");
+  const double LogOverlapFactor = wset.getLogOverlapFactor();
+  const ComplexType inv_P(1.0 / static_cast<double>(P), 0.0);
+  const WALKER_TYPES wt = nomsd_.getWalkerType();
+  auto& SDetOp          = *nomsd_.getSlaterDetOperations();
+
+  fill_n(Ov.origin(), nw, ComplexType(0));
+
+  // Distribute the nw*P (outer walker, inner walker) pairs across the local task group;
+  // task tk = iw * P + ip.
+  int tk0, tkN;
+  std::tie(tk0, tkN) = FairDivideBoundary(TG_.getLocalTGRank(), nw * P, TG_.getNCoresPerTG());
+
+  for (int tk = tk0; tk < tkN; ++tk)
+  {
+    const int iw = tk / P;
+    const int ip = tk % P;
+    if (wt != COLLINEAR)
+    {
+      ComplexType ov = SDetOp.Overlap(*inner[ip].SlaterMatrix(Alpha), *wset[iw].SlaterMatrix(Alpha),
+                                      LogOverlapFactor, false);
+      Ov[iw] += inv_P * ov * ((wt == CLOSED) ? ov : ComplexType(1.0, 0.0));
+    }
+    else
+    {
+      ComplexType ov = SDetOp.Overlap(*inner[ip].SlaterMatrix(Alpha), *wset[iw].SlaterMatrix(Alpha),
+                                      LogOverlapFactor, false);
+      ov *= SDetOp.Overlap(*inner[ip].SlaterMatrix(Beta), *wset[iw].SlaterMatrix(Beta),
+                           LogOverlapFactor, false);
+      Ov[iw] += inv_P * ov;
+    }
+  }
+
+  if (TG_.TG_local().size() > 1)
+    TG_.TG_local().all_reduce_in_place_n(raw_pointer_cast(Ov.origin()), nw, std::plus<>());
+}
+
+template<bool MP, class devPsiT>
+template<class WlkSet>
+void StochasticWfn<MP, devPsiT>::Overlap(WlkSet& wset)
+{
+  int nw = wset.size();
+  StaticVector ovlp(iextensions<1u>{nw}, buffer_manager.get_generator().template get_allocator<ComplexType>());
+  Overlap(wset, ovlp);
+  TG_.TG_local().barrier();
+  if (TG_.getLocalTGRank() == 0)
+    wset.setProperty(OVLP, ovlp);
+  TG_.TG_local().barrier();
 }
 
 template<bool MP, class devPsiT>

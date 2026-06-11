@@ -312,17 +312,18 @@ public:
     nomsd_.MixedDensityMatrix_for_vbias(wset, std::forward<MatG>(G));
   }
 
+  // Phase 2a: stochastic trial overlap. Reduces the inner ensemble {psi_p} into an
+  // effective overlap per outer walker, Ov[w] = (1/P) sum_p <psi_p | phi_w>, following
+  // Eq. 24 of arXiv:2505.18519 in the static-ensemble limit (inner_nsteps = 0, where
+  // B_T = 1 so the phase factor / importance reweighting are degenerate). At the
+  // single-determinant delegate limit this equals the NOMSD overlap exactly. The
+  // phase/importance-sampling (Eq. 25-26) and inner-propagation leapfrog arrive in
+  // Phase 3 (propagator hot path), not here. Definitions in StochasticWfn.icc.
   template<class WlkSet, class TVec>
-  void Overlap(const WlkSet& wset, TVec&& Ov)
-  {
-    nomsd_.Overlap(wset, std::forward<TVec>(Ov));
-  }
+  void Overlap(const WlkSet& wset, TVec&& Ov);
 
   template<class WlkSet>
-  void Overlap(WlkSet& wset)
-  {
-    nomsd_.Overlap(wset);
-  }
+  void Overlap(WlkSet& wset);
 
   template<class... Args>
   void accumulate_estimators(Args&&... args)

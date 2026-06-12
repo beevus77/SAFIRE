@@ -82,9 +82,18 @@ struct StochasticInnerStack
 template<bool MP, class devPsiT>
 class StochasticWfn : public AFQMCInfo
 {
-  // Buffer manager for transient overlap work vectors (mirrors NOMSD).
-  using buffer_alloc_type = DeviceBufferManager::template allocator_t<ComplexType>;
-  using StaticVector      = boost::multi::static_array<ComplexType, 1, buffer_alloc_type>;
+  // Buffer managers and work-vector types for the Overlap / Energy reductions (mirror NOMSD).
+  // buffer_alloc_type backs per-core transient vectors/matrices (overlaps, energy components);
+  // shm_buffer_alloc_type backs the shared mixed density matrix the energy reduction fills.
+  using buffer_alloc_type     = DeviceBufferManager::template allocator_t<ComplexType>;
+  using shm_buffer_alloc_type = LocalTGBufferManager::template allocator_t<ComplexType>;
+  using StaticVector          = boost::multi::static_array<ComplexType, 1, buffer_alloc_type>;
+  using StaticMatrix          = boost::multi::static_array<ComplexType, 2, buffer_alloc_type>;
+  using StaticSHMVector       = boost::multi::static_array<ComplexType, 1, shm_buffer_alloc_type>;
+  using Allocator             = device_allocator<ComplexType>;
+  using pointer               = typename std::allocator_traits<Allocator>::pointer;
+  using CMatrix_ref           = boost::multi::array_ref<ComplexType, 2, pointer>;
+  using CVector_ref           = boost::multi::array_ref<ComplexType, 1, pointer>;
 
   struct StochasticInnerEnsemble
   {
@@ -98,6 +107,7 @@ class StochasticWfn : public AFQMCInfo
   int inner_nwalkers_{1};
   int inner_nsteps_{0};
   DeviceBufferManager buffer_manager;
+  LocalTGBufferManager shm_buffer_manager;
   NOMSD<MP, devPsiT> nomsd_;
   std::unique_ptr<StochasticInnerStack<MP, devPsiT>> inner_stack_;
 
@@ -122,6 +132,7 @@ public:
       : AFQMCInfo(info),
         TG_(tg_),
         buffer_manager(),
+        shm_buffer_manager(),
         nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(outer_sdet_), std::move(outer_hop_), std::move(ci_),
                std::move(orbs_), wlk, nce, targetNW),
         inner_stack_(std::move(inner_stack_in))

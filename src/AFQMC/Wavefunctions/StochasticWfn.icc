@@ -162,12 +162,19 @@ void StochasticWfn<MP, devPsiT>::Overlap(WlkSet& wset)
  * stochastic_energy_matches_nomsd test asserts this Overlap/Energy agreement within Approx.
  *
  * The cross mixed DM uses herm = false (the inner walker Slater matrix is [NMO, NEL], as in
- * Phase 2a Overlap, rather than the pre-transposed trial NOMSD passes with herm = true). The
- * energy evaluator is called with nd = 0 because in the static-ensemble limit every inner
- * walker equals the inner trial's anchor determinant (getInitialGuess == OrbMats[0]), whose
- * half-rotated integrals back the nd = 0 energy; this is the single-determinant assumption that
- * Phase 3 must revisit once inner_nsteps > 0 propagates the inner walkers away from the anchor.
- * At the single-determinant delegate limit both E and Ov reproduce NOMSD exactly.
+ * Phase 2a Overlap, rather than the pre-transposed trial NOMSD passes with herm = true).
+ *
+ * Hamiltonian sourcing (dual-Hamiltonian architecture; see StochasticDevelopment.md): H is the
+ * *True* Hamiltonian, which lives in the OUTER delegate nomsd_ -- so the cross DM and energy_from_G
+ * run on nomsd_, NOT inner_nomsd(). The inner stack's HamOps becomes the *Variational* Hamiltonian
+ * once Phase 3b drives B_T, at which point inner_nomsd().energy_from_G would return the wrong
+ * operator. (The bras psi_p are still the inner WALKERS from inner_ensemble_.wset; only the
+ * Ham-dependent contraction is scored on nomsd_. The cross DM itself is Hamiltonian-independent.)
+ * energy_from_G is called with nd = 0 because in the static-ensemble limit every inner walker
+ * equals the trial's anchor determinant (getInitialGuess == OrbMats[0]), whose half-rotated
+ * integrals back the nd = 0 energy; Phase 3b must revisit this (per-walker nd) once inner walkers
+ * are propagated away from the anchor. At the single-determinant delegate limit both E and Ov
+ * reproduce NOMSD exactly.
  */
 template<bool MP, class devPsiT>
 template<class WlkSet, class Mat, class TVec>
@@ -196,9 +203,11 @@ void StochasticWfn<MP, devPsiT>::Energy(const WlkSet& wset, Mat&& E, TVec&& Ov)
   const int P      = inner.size();
   RUNTIME_CHECK(P >= 1, "");
 
-  // The inner NOMSD owns the stochastic-trial HamOps/SDetOp and shares TG_ with the outer
-  // delegate, so its DensityMatrix / energy_from_G barriers stay consistent with this reduction.
-  NOMSD<MP, devPsiT>& ref = inner_nomsd();
+  // Score against the True Hamiltonian: use the OUTER delegate nomsd_, not inner_nomsd() (whose
+  // HamOps becomes the Variational Ham at Phase 3b). nomsd_ shares TG_ with this reduction, so its
+  // DensityMatrix / energy_from_G barriers stay consistent. The bras psi_p are the inner WALKERS
+  // (inner_ensemble_.wset, indexed below); only the Ham-dependent contraction lives on nomsd_.
+  NOMSD<MP, devPsiT>& ref = nomsd_;
   const ComplexType zero(0.0);
   const ComplexType inv_P(1.0 / static_cast<double>(P), 0.0);
   const bool collinear    = (ref.getWalkerType() == COLLINEAR);

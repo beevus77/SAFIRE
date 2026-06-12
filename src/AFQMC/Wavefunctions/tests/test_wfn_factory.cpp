@@ -627,18 +627,26 @@ void stochastic_wfn_matches_nomsd(boost::mpi3::communicator& world)
   ctx.TG.TG_local().barrier();
 
   REQUIRE(wset_stoch.size() == ov_ref.size());
-  for (int n = 0; n < static_cast<int>(ov_ref.size()); ++n)
+  // Overlap (Phase 2a) and Energy (Phase 2b) reduce a single-determinant inner ensemble, so they
+  // equal NOMSD only at the single-determinant delegate limit; a multi-determinant trial diverges
+  // by design (see StochasticDevelopment.md and the dedicated stochastic_overlap_matches_nomsd /
+  // stochastic_energy_matches_nomsd tests). Gate on ndet == 1. The MixedDensityMatrix_for_vbias /
+  // vbias comparisons below still delegate to nomsd_ (Phase 3) and stay unconditional.
+  if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
   {
-    REQUIRE(real(ComplexType(*wset_stoch[n].overlap())) == Approx(real(ov_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].overlap())) == Approx(imag(ov_ref[n])));
-    REQUIRE(real(ComplexType(*wset_stoch[n].E1())) == Approx(real(E1_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].E1())) == Approx(imag(E1_ref[n])));
-    REQUIRE(real(ComplexType(*wset_stoch[n].EXX())) == Approx(real(EXX_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].EXX())) == Approx(imag(EXX_ref[n])));
-    REQUIRE(real(ComplexType(*wset_stoch[n].EJ())) == Approx(real(EJ_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].EJ())) == Approx(imag(EJ_ref[n])));
-    REQUIRE(real(ComplexType(wset_stoch[n].energy())) == Approx(real(Etot_ref[n])));
-    REQUIRE(imag(ComplexType(wset_stoch[n].energy())) == Approx(imag(Etot_ref[n])));
+    for (int n = 0; n < static_cast<int>(ov_ref.size()); ++n)
+    {
+      REQUIRE(real(ComplexType(*wset_stoch[n].overlap())) == Approx(real(ov_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].overlap())) == Approx(imag(ov_ref[n])));
+      REQUIRE(real(ComplexType(*wset_stoch[n].E1())) == Approx(real(E1_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].E1())) == Approx(imag(E1_ref[n])));
+      REQUIRE(real(ComplexType(*wset_stoch[n].EXX())) == Approx(real(EXX_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].EXX())) == Approx(imag(EXX_ref[n])));
+      REQUIRE(real(ComplexType(*wset_stoch[n].EJ())) == Approx(real(EJ_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].EJ())) == Approx(imag(EJ_ref[n])));
+      REQUIRE(real(ComplexType(wset_stoch[n].energy())) == Approx(real(Etot_ref[n])));
+      REQUIRE(imag(ComplexType(wset_stoch[n].energy())) == Approx(imag(Etot_ref[n])));
+    }
   }
 
   CMatrix G_stoch({Gdim1, Gdim2}, ctx.alloc_);

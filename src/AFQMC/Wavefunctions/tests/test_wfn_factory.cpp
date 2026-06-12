@@ -627,18 +627,26 @@ void stochastic_wfn_matches_nomsd(boost::mpi3::communicator& world)
   ctx.TG.TG_local().barrier();
 
   REQUIRE(wset_stoch.size() == ov_ref.size());
-  for (int n = 0; n < static_cast<int>(ov_ref.size()); ++n)
+  // Overlap (Phase 2a) and Energy (Phase 2b) reduce a single-determinant inner ensemble, so they
+  // equal NOMSD only at the single-determinant delegate limit; a multi-determinant trial diverges
+  // by design (see StochasticDevelopment.md and the dedicated stochastic_overlap_matches_nomsd /
+  // stochastic_energy_matches_nomsd tests). Gate on ndet == 1. The MixedDensityMatrix_for_vbias /
+  // vbias comparisons below still delegate to nomsd_ (Phase 3) and stay unconditional.
+  if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
   {
-    REQUIRE(real(ComplexType(*wset_stoch[n].overlap())) == Approx(real(ov_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].overlap())) == Approx(imag(ov_ref[n])));
-    REQUIRE(real(ComplexType(*wset_stoch[n].E1())) == Approx(real(E1_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].E1())) == Approx(imag(E1_ref[n])));
-    REQUIRE(real(ComplexType(*wset_stoch[n].EXX())) == Approx(real(EXX_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].EXX())) == Approx(imag(EXX_ref[n])));
-    REQUIRE(real(ComplexType(*wset_stoch[n].EJ())) == Approx(real(EJ_ref[n])));
-    REQUIRE(imag(ComplexType(*wset_stoch[n].EJ())) == Approx(imag(EJ_ref[n])));
-    REQUIRE(real(ComplexType(wset_stoch[n].energy())) == Approx(real(Etot_ref[n])));
-    REQUIRE(imag(ComplexType(wset_stoch[n].energy())) == Approx(imag(Etot_ref[n])));
+    for (int n = 0; n < static_cast<int>(ov_ref.size()); ++n)
+    {
+      REQUIRE(real(ComplexType(*wset_stoch[n].overlap())) == Approx(real(ov_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].overlap())) == Approx(imag(ov_ref[n])));
+      REQUIRE(real(ComplexType(*wset_stoch[n].E1())) == Approx(real(E1_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].E1())) == Approx(imag(E1_ref[n])));
+      REQUIRE(real(ComplexType(*wset_stoch[n].EXX())) == Approx(real(EXX_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].EXX())) == Approx(imag(EXX_ref[n])));
+      REQUIRE(real(ComplexType(*wset_stoch[n].EJ())) == Approx(real(EJ_ref[n])));
+      REQUIRE(imag(ComplexType(*wset_stoch[n].EJ())) == Approx(imag(EJ_ref[n])));
+      REQUIRE(real(ComplexType(wset_stoch[n].energy())) == Approx(real(Etot_ref[n])));
+      REQUIRE(imag(ComplexType(wset_stoch[n].energy())) == Approx(imag(Etot_ref[n])));
+    }
   }
 
   CMatrix G_stoch({Gdim1, Gdim2}, ctx.alloc_);
@@ -966,6 +974,133 @@ void stochastic_overlap_matches_nomsd(boost::mpi3::communicator& world)
     {
       REQUIRE(real(ov_s1[n]) == Approx(real(ov_ref[n])));
       REQUIRE(imag(ov_s1[n]) == Approx(imag(ov_ref[n])));
+    }
+  }
+
+  ctx.TG.Global().barrier();
+}
+
+// Phase 2b: the overridden StochasticWfn::Energy reduces the inner ensemble into an effective
+// local energy (E1, EXX, EJ) and overlap per outer walker (Eq. 27 of arXiv:2505.18519, static-
+// ensemble limit). Mirrors stochastic_overlap_matches_nomsd. Verifies:
+//   (1) inner_nwalkers invariance -- a static replicated ensemble (inner_nsteps = 0) gives
+//       energies and overlaps independent of inner_nwalkers;
+//   (2) delegate limit -- for a single-determinant trial the stochastic E1/EXX/EJ/energy and
+//       overlap equal the NOMSD result exactly. Multi-determinant trials (e.g. wfn_msd.h5)
+//       intentionally diverge -- a single-determinant inner ensemble cannot reproduce the
+//       CI-weighted NOMSD energy -- so that assertion is gated on ndet == 1.
+template<bool MP, class Allocator>
+void stochastic_energy_matches_nomsd(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_HAMIL) || not file_exists(UTEST_WFN))
+    APP_ABORT(" Hamiltonian or wavefunction file not found. Run unit test with --hamil /path/to/hamil.h5 and --wfn /path/to/wfn.h5.");
+  if (afqmc::getWavefunctionType(UTEST_WFN) != "NOMSD")
+    return;
+
+  WfnTestContext<MP, Allocator> ctx(world);
+  Wavefunction& wfn_nomsd =
+      ctx.register_wavefunction("wfn_nomsd_en", ctx.make_wfn_pt("wfn_nomsd_en", UTEST_WFN, false));
+  Wavefunction& wfn_s1 =
+      ctx.register_wavefunction("wfn_stoch_en1", ctx.make_wfn_pt("wfn_stoch_en1", UTEST_WFN, true, 1));
+  Wavefunction& wfn_s3 =
+      ctx.register_wavefunction("wfn_stoch_en3", ctx.make_wfn_pt("wfn_stoch_en3", UTEST_WFN, true, 3));
+
+  struct WalkerEnergies
+  {
+    std::vector<ComplexType> ov, E1, EXX, EJ, Etot;
+  };
+  auto collect_energies = [&](Wavefunction& wfn, const std::string& guess_id) {
+    WalkerSet wset = ctx.make_walker_set();
+    ctx.init_walkers(wset, guess_id);
+    wfn.Energy(wset);
+    ctx.TG.TG_local().barrier();
+    WalkerEnergies out;
+    for (auto it = wset.begin(); it != wset.end(); ++it)
+    {
+      out.ov.push_back(ComplexType(*it->overlap()));
+      out.E1.push_back(ComplexType(*it->E1()));
+      out.EXX.push_back(ComplexType(*it->EXX()));
+      out.EJ.push_back(ComplexType(*it->EJ()));
+      out.Etot.push_back(ComplexType(it->energy()));
+    }
+    return out;
+  };
+
+  WalkerEnergies ref = collect_energies(wfn_nomsd, "wfn_nomsd_en");
+  WalkerEnergies s1  = collect_energies(wfn_s1, "wfn_nomsd_en");
+  WalkerEnergies s3  = collect_energies(wfn_s3, "wfn_nomsd_en");
+
+  REQUIRE(s1.ov.size() == ref.ov.size());
+  REQUIRE(s3.ov.size() == ref.ov.size());
+
+  // (1) inner_nwalkers invariance: a static replicated ensemble gives identical observables.
+  for (int n = 0; n < static_cast<int>(s1.ov.size()); ++n)
+  {
+    REQUIRE(real(s3.ov[n]) == Approx(real(s1.ov[n])));
+    REQUIRE(imag(s3.ov[n]) == Approx(imag(s1.ov[n])));
+    REQUIRE(real(s3.E1[n]) == Approx(real(s1.E1[n])));
+    REQUIRE(imag(s3.E1[n]) == Approx(imag(s1.E1[n])));
+    REQUIRE(real(s3.EXX[n]) == Approx(real(s1.EXX[n])));
+    REQUIRE(imag(s3.EXX[n]) == Approx(imag(s1.EXX[n])));
+    REQUIRE(real(s3.EJ[n]) == Approx(real(s1.EJ[n])));
+    REQUIRE(imag(s3.EJ[n]) == Approx(imag(s1.EJ[n])));
+    REQUIRE(real(s3.Etot[n]) == Approx(real(s1.Etot[n])));
+    REQUIRE(imag(s3.Etot[n]) == Approx(imag(s1.Etot[n])));
+  }
+
+  // (2) delegate limit: single-determinant trial => stochastic energy == NOMSD energy.
+  if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
+  {
+    for (int n = 0; n < static_cast<int>(s1.ov.size()); ++n)
+    {
+      REQUIRE(real(s1.ov[n]) == Approx(real(ref.ov[n])));
+      REQUIRE(imag(s1.ov[n]) == Approx(imag(ref.ov[n])));
+      REQUIRE(real(s1.E1[n]) == Approx(real(ref.E1[n])));
+      REQUIRE(imag(s1.E1[n]) == Approx(imag(ref.E1[n])));
+      REQUIRE(real(s1.EXX[n]) == Approx(real(ref.EXX[n])));
+      REQUIRE(imag(s1.EXX[n]) == Approx(imag(ref.EXX[n])));
+      REQUIRE(real(s1.EJ[n]) == Approx(real(ref.EJ[n])));
+      REQUIRE(imag(s1.EJ[n]) == Approx(imag(ref.EJ[n])));
+      REQUIRE(real(s1.Etot[n]) == Approx(real(ref.Etot[n])));
+      REQUIRE(imag(s1.Etot[n]) == Approx(imag(ref.Etot[n])));
+    }
+  }
+
+  // (3) Overlap/Energy consistency: Energy's Ov is the same reduction as the Phase 2a Overlap
+  // (same per-pair (1/P)<psi_p|phi_w> terms), so Overlap(wset) and the overlap from Energy(wset)
+  // agree within rounding. This locks in the invariant the docs claim, across two code paths
+  // that compute it differently (2a: outer SDetOp + FairDivide + all_reduce; 2b: inner
+  // DensityMatrix + axpy).
+  {
+    WalkerSet wset = ctx.make_walker_set();
+    ctx.init_walkers(wset, "wfn_nomsd_en");
+    wfn_s1.Overlap(wset);
+    ctx.TG.TG_local().barrier();
+    int n = 0;
+    for (auto it = wset.begin(); it != wset.end(); ++it, ++n)
+    {
+      REQUIRE(real(ComplexType(*it->overlap())) == Approx(real(s1.ov[n])));
+      REQUIRE(imag(ComplexType(*it->overlap())) == Approx(imag(s1.ov[n])));
+    }
+  }
+
+  // (4) Propagator entry point: the 3-arg Energy(wset, E, Ov) -- called directly by the
+  // local-energy propagation path in AFQMCBasePropagator::step (not the property-setter form) --
+  // agrees with Energy(wset). Exercises the 3-arg overload with caller-allocated buffers.
+  {
+    WalkerSet wset = ctx.make_walker_set();
+    ctx.init_walkers(wset, "wfn_nomsd_en");
+    Matrix_<Allocator> E_direct({ctx.nwalk, 3}, ctx.alloc_);
+    Vector_<Allocator> Ov_direct(iextensions<1u>{ctx.nwalk}, ctx.alloc_);
+    wfn_s1.Energy(wset, E_direct, Ov_direct);
+    ctx.TG.TG_local().barrier();
+    for (int n = 0; n < ctx.nwalk; ++n)
+    {
+      REQUIRE(real(ComplexType(Ov_direct[n])) == Approx(real(s1.ov[n])));
+      REQUIRE(imag(ComplexType(Ov_direct[n])) == Approx(imag(s1.ov[n])));
+      REQUIRE(real(ComplexType(E_direct[n][0])) == Approx(real(s1.E1[n])));
+      REQUIRE(real(ComplexType(E_direct[n][1])) == Approx(real(s1.EXX[n])));
+      REQUIRE(real(ComplexType(E_direct[n][2])) == Approx(real(s1.EJ[n])));
     }
   }
 
@@ -1685,6 +1820,25 @@ TEST_CASE("stochastic_overlap_matches_nomsd", "[wavefunction_factory][stochastic
 
   stochastic_overlap_matches_nomsd<false, Alloc>(world);
   stochastic_overlap_matches_nomsd<true, Alloc>(world);
+  release_memory_managers();
+}
+
+TEST_CASE("stochastic_energy_matches_nomsd", "[wavefunction_factory][stochastic_wfn]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto node  = world.split_shared(world.rank());
+  setup_loggers(world.root(), 2, 2);
+
+#if defined(ENABLE_DEVICE)
+  arch::INIT(node);
+  using Alloc = device::device_allocator<ComplexType>;
+#else
+  using Alloc = shared_allocator<ComplexType>;
+#endif
+  setup_memory_managers(node, 10uL * 1024uL * 1024uL);
+
+  stochastic_energy_matches_nomsd<false, Alloc>(world);
+  stochastic_energy_matches_nomsd<true, Alloc>(world);
   release_memory_managers();
 }
 

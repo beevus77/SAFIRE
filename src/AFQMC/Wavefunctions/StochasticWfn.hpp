@@ -82,9 +82,18 @@ struct StochasticInnerStack
 template<bool MP, class devPsiT>
 class StochasticWfn : public AFQMCInfo
 {
-  // Buffer manager for transient overlap work vectors (mirrors NOMSD).
-  using buffer_alloc_type = DeviceBufferManager::template allocator_t<ComplexType>;
-  using StaticVector      = boost::multi::static_array<ComplexType, 1, buffer_alloc_type>;
+  // Buffer managers and work-vector types for the Overlap / Energy reductions (mirror NOMSD).
+  // buffer_alloc_type backs per-core transient vectors/matrices (overlaps, energy components);
+  // shm_buffer_alloc_type backs the shared mixed density matrix the energy reduction fills.
+  using buffer_alloc_type     = DeviceBufferManager::template allocator_t<ComplexType>;
+  using shm_buffer_alloc_type = LocalTGBufferManager::template allocator_t<ComplexType>;
+  using StaticVector          = boost::multi::static_array<ComplexType, 1, buffer_alloc_type>;
+  using StaticMatrix          = boost::multi::static_array<ComplexType, 2, buffer_alloc_type>;
+  using StaticSHMVector       = boost::multi::static_array<ComplexType, 1, shm_buffer_alloc_type>;
+  using Allocator             = device_allocator<ComplexType>;
+  using pointer               = typename std::allocator_traits<Allocator>::pointer;
+  using CMatrix_ref           = boost::multi::array_ref<ComplexType, 2, pointer>;
+  using CVector_ref           = boost::multi::array_ref<ComplexType, 1, pointer>;
 
   struct StochasticInnerEnsemble
   {
@@ -98,6 +107,7 @@ class StochasticWfn : public AFQMCInfo
   int inner_nwalkers_{1};
   int inner_nsteps_{0};
   DeviceBufferManager buffer_manager;
+  LocalTGBufferManager shm_buffer_manager;
   NOMSD<MP, devPsiT> nomsd_;
   std::unique_ptr<StochasticInnerStack<MP, devPsiT>> inner_stack_;
 
@@ -122,6 +132,7 @@ public:
       : AFQMCInfo(info),
         TG_(tg_),
         buffer_manager(),
+        shm_buffer_manager(),
         nomsd_(info, nomsd_inputs(pt_in), tg_, std::move(outer_sdet_), std::move(outer_hop_), std::move(ci_),
                std::move(orbs_), wlk, nce, targetNW),
         inner_stack_(std::move(inner_stack_in))
@@ -268,17 +279,19 @@ public:
     nomsd_.vHS(std::forward<MatX>(X), std::forward<MatA>(v), dt, a);
   }
 
+  // Phase 2b: stochastic local energy. Reduces the inner ensemble {psi_p} into an effective
+  // local energy and overlap per outer walker,
+  //   E[w] = sum_p <psi_p|H|phi_w> / sum_p <psi_p|phi_w>,   Ov[w] = (1/P) sum_p <psi_p|phi_w>,
+  // the inner_nsteps = 0 specialization of Eq. 27 of arXiv:2505.18519 (B_T = 1, so the phase
+  // factor S(Y) and importance reweighting are degenerate). Ov[w] matches Phase 2a Overlap, and
+  // at the single-determinant delegate limit both E and Ov equal the NOMSD result. Mirrors
+  // NOMSD::Energy_shared with the trial-determinant loop replaced by the inner-walker loop and
+  // the CI weight conj(ci[nd]) replaced by 1/P. Definitions in StochasticWfn.icc.
   template<class WlkSet>
-  void Energy(WlkSet& wset)
-  {
-    nomsd_.Energy(wset);
-  }
+  void Energy(WlkSet& wset);
 
   template<class WlkSet, class Mat, class TVec>
-  void Energy(const WlkSet& wset, Mat&& E, TVec&& Ov)
-  {
-    nomsd_.Energy(wset, std::forward<Mat>(E), std::forward<TVec>(Ov));
-  }
+  void Energy(const WlkSet& wset, Mat&& E, TVec&& Ov);
 
   template<class WlkSet, class MatG>
   void MixedDensityMatrix(const WlkSet& wset, MatG&& G, bool compact = true, bool transpose = false)

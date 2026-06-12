@@ -38,6 +38,13 @@ namespace sfqmc
 {
 namespace afqmc
 {
+// Forward declaration: StochasticWfn (a Wavefunction-variant alternative defined in
+// StochasticWfn.hpp, which includes this header) is granted friendship below so its Phase 2b
+// Energy reduction can reuse NOMSD's protected energy_from_G / dm_size seams without growing
+// NOMSD's public interface.
+template<bool MP, class devPsiT>
+class StochasticWfn;
+
 /*
  * Class that implements a multi-Slater determinant trial wave-function.
  * Single determinant wfns are also allowed. 
@@ -48,6 +55,12 @@ namespace afqmc
 template<bool MP, class devPsiT>
 class NOMSD : public AFQMCInfo
 {
+  // StochasticWfn (Phase 2b) reduces an inner NOMSD's ensemble onto outer walkers; grant it
+  // access to the protected energy_from_G / dm_size seams that reduction reuses, so the public
+  // NOMSD interface stays unchanged.
+  template<bool MP_, class devPsiT_>
+  friend class StochasticWfn;
+
   // Note:
   // if number_of_devices > 0, nextra should always be 0,
   // so code doesn't need to be portable in places guarded by if(nextra>0)
@@ -604,6 +617,18 @@ protected:
      */
   template<class WlkSet, class Mat, class TVec>
   void Energy_shared(const WlkSet& wset, Mat&& E, TVec&& Ov);
+
+  /*
+     * Energy components (E1, EXX, EJ) of a precomputed mixed density matrix G against trial
+     * determinant nd. Named seam over HamOp.energy (nd selects that determinant's half-rotated
+     * integrals, which are tied to its bra orbitals). Protected + friend-accessible: used by
+     * StochasticWfn's Phase 2b cross-walker energy reduction, not part of the public interface.
+     */
+  template<class Mat, class MatG>
+  void energy_from_G(Mat&& E, MatG const& G, int nd, bool addH1 = true)
+  {
+    HamOp.energy(std::forward<Mat>(E), G, nd, addH1);
+  }
 
   template<class WlkSet, class MatG, class TVec>
   void MixedDensityMatrix_shared(const WlkSet& wset, MatG&& G, TVec&& Ov, bool compact = true, bool transpose = false);

@@ -144,6 +144,124 @@ void StochasticWfn<MP, devPsiT>::Overlap(WlkSet& wset)
   TG_.TG_local().barrier();
 }
 
+/*
+ * Stochastic trial local energy (Phase 2b, static-ensemble limit). For each outer walker phi_w
+ * we reduce the inner ensemble {psi_p} (p = 0..P-1) into an effective local energy and overlap
+ *   E[w]  = sum_p <psi_p|H|phi_w> / sum_p <psi_p|phi_w>,
+ *   Ov[w] = (1/P) sum_p <psi_p|phi_w>,
+ * the inner_nsteps = 0 specialization of Eq. 27 of arXiv:2505.18519 (B_T = 1, so the phase
+ * factor S(Y) and importance reweighting of Eq. 25-26 are degenerate and reduce to a plain
+ * average; those arrive with the inner-propagation leapfrog in Phase 3). The reduction mirrors
+ * NOMSD::Energy_shared exactly, with the trial-determinant loop replaced by the inner-walker
+ * loop and the CI weight conj(ci[nd]) replaced by 1/P: per inner walker we form the cross mixed
+ * density matrix against every outer walker, accumulate (1/P)<psi_p|phi_w> into Ov and
+ * (1/P)<psi_p|phi_w> E_{p,w} into E, then divide E by Ov to obtain the local energy. The 1/P
+ * cancels in E but is kept so Ov[w] is the same reduction as Phase 2a Overlap -- the same
+ * per-pair terms (1/P)<psi_p|phi_w>, hence equal up to floating-point summation order (Phase 2a
+ * sums nw*P pairs via FairDivide + all_reduce; here we sum per inner walker). The
+ * stochastic_energy_matches_nomsd test asserts this Overlap/Energy agreement within Approx.
+ *
+ * The cross mixed DM uses herm = false (the inner walker Slater matrix is [NMO, NEL], as in
+ * Phase 2a Overlap, rather than the pre-transposed trial NOMSD passes with herm = true). The
+ * energy evaluator is called with nd = 0 because in the static-ensemble limit every inner
+ * walker equals the inner trial's anchor determinant (getInitialGuess == OrbMats[0]), whose
+ * half-rotated integrals back the nd = 0 energy; this is the single-determinant assumption that
+ * Phase 3 must revisit once inner_nsteps > 0 propagates the inner walkers away from the anchor.
+ * At the single-determinant delegate limit both E and Ov reproduce NOMSD exactly.
+ */
+template<bool MP, class devPsiT>
+template<class WlkSet, class Mat, class TVec>
+void StochasticWfn<MP, devPsiT>::Energy(const WlkSet& wset, Mat&& E, TVec&& Ov)
+{
+  using std::fill_n;
+  if (not inner_ensemble_.initialized || inner_ensemble_.wset == nullptr)
+    APP_ABORT("Error in StochasticWfn::Energy: inner walkers not initialized "
+              "(call maybe_initialize_stochastic_inner_walkers first).");
+  // Cholesky-distributed reduction (NGroupsPerTG > 1) is deferred: a single energy_from_G call
+  // sees only this group's Cholesky vectors, so it would return a partial energy. NOMSD handles
+  // this with a ring reduction (Energy_distributed); Phase 2b targets the shared limit.
+  if (TG_.getNGroupsPerTG() > 1)
+    APP_ABORT("Error in StochasticWfn::Energy: distributed (NGroupsPerTG > 1) stochastic energy "
+              "not yet supported (Phase 2b is shared-only; see StochasticDevelopment.md).");
+
+  RUNTIME_CHECK(E.dimensionality == 2, "");
+  RUNTIME_CHECK(Ov.dimensionality == 1, "");
+  RUNTIME_CHECK(E.size(0) == wset.size(), "");
+  RUNTIME_CHECK(E.size(1) == 3, "");
+  RUNTIME_CHECK(E.stride(0) == E.size(1), ""); // contiguous: fill_n / all_reduce span 3*nwalk
+  RUNTIME_CHECK(Ov.size(0) == wset.size(), "");
+
+  WalkerSet& inner = *inner_ensemble_.wset;
+  const int nwalk  = wset.size();
+  const int P      = inner.size();
+  RUNTIME_CHECK(P >= 1, "");
+
+  // The inner NOMSD owns the stochastic-trial HamOps/SDetOp and shares TG_ with the outer
+  // delegate, so its DensityMatrix / energy_from_G barriers stay consistent with this reduction.
+  NOMSD<MP, devPsiT>& ref = inner_nomsd();
+  const ComplexType zero(0.0);
+  const ComplexType inv_P(1.0 / static_cast<double>(P), 0.0);
+  const bool collinear    = (ref.getWalkerType() == COLLINEAR);
+  const bool transposed_E = ref.transposed_G_for_E();
+  const int Gsize         = ref.dm_size(false); // compact G size; dm_size is friend-accessible
+
+  // Shared mixed density matrix G with its per-walker overlap ov_ packed contiguously after it
+  // (mirrors NOMSD::Energy_shared); per-core energy components eloc2.
+  int nr = Gsize, nc = nwalk;
+  if (transposed_E)
+    std::swap(nr, nc);
+  StaticSHMVector shmbuff(iextensions<1u>{(Gsize + 1) * nwalk}, ComplexType(0.0),
+                          shm_buffer_manager.get_generator().template get_allocator<ComplexType>());
+  CMatrix_ref G(make_device_ptr(shmbuff.origin()), {nr, nc});
+  CVector_ref ov_(G.origin() + G.num_elements(), iextensions<1u>{nwalk});
+  StaticMatrix eloc2({nwalk, 3}, ComplexType(0.0),
+                     buffer_manager.get_generator().template get_allocator<ComplexType>());
+
+  fill_n(Ov.origin(), nwalk, zero);
+  fill_n(E.origin(), 3 * nwalk, zero);
+
+  for (int ip = 0; ip < P; ++ip)
+  {
+    auto smA = inner[ip].SlaterMatrix(Alpha);
+    auto smB = (collinear ? inner[ip].SlaterMatrix(Beta) : inner[ip].SlaterMatrix(Alpha));
+    // G = <psi_p|c^dag c|phi_w>/<psi_p|phi_w>, ov_ = <psi_p|phi_w> (squared for CLOSED, as in NOMSD).
+    ref.DensityMatrix(wset, *smA, *smB, G, ov_, /*herm=*/false, /*compact=*/true, transposed_E);
+    // Ov[w] += (1/P) <psi_p|phi_w>   -- the Phase 2a overlap reduction term.
+    ma::axpy(inv_P, ov_, Ov);
+    // eloc2[w][k] = E_{p,w}[k] = (E1, EXX, EJ) of the cross mixed DM (overwritten each iteration).
+    ref.energy_from_G(eloc2, G, /*nd=*/0, TG_.TG_local().root());
+    // eloc2[w][k] *= (1/P) <psi_p|phi_w>   -- weight the local energy by its overlap.
+    ma::elementwise(ma::TOp_MUL, 0, inv_P, ov_, eloc2);
+    // E[w][k] += eloc2[w][k]   -- accumulate the energy numerator.
+    ma::add(ComplexType(1.0), eloc2, ComplexType(1.0), E, E);
+  }
+
+  // E holds partial (per-core) energy numerators; reduce, then divide by the total overlap Ov.
+  if (TG_.TG_local().size() > 1)
+    TG_.TG_local().all_reduce_in_place_n(raw_pointer_cast(E.origin()), 3 * nwalk, std::plus<>());
+  ma::elementwise(ma::TOp_DIV, 0, Ov, E);
+  TG_.TG_local().barrier();
+}
+
+template<bool MP, class devPsiT>
+template<class WlkSet>
+void StochasticWfn<MP, devPsiT>::Energy(WlkSet& wset)
+{
+  int nw = wset.size();
+  StaticVector ovlp(iextensions<1u>{nw}, buffer_manager.get_generator().template get_allocator<ComplexType>());
+  StaticMatrix eloc({nw, 3}, buffer_manager.get_generator().template get_allocator<ComplexType>());
+  Energy(wset, eloc, ovlp);
+  TG_.TG_local().barrier();
+  if (TG_.getLocalTGRank() == 0)
+  {
+    wset.setProperty(OVLP, ovlp);
+    wset.setProperty(E1_, eloc(eloc.extension(), 0));
+    wset.setProperty(EXX_, eloc(eloc.extension(), 1));
+    wset.setProperty(EJ_, eloc(eloc.extension(), 2));
+  }
+  TG_.TG_local().barrier();
+}
+
 template<bool MP, class devPsiT>
 template<class Mat>
 void StochasticWfn<MP, devPsiT>::G_MF(Mat&& G)

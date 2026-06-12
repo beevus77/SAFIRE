@@ -279,17 +279,19 @@ public:
     nomsd_.vHS(std::forward<MatX>(X), std::forward<MatA>(v), dt, a);
   }
 
+  // Phase 2b: stochastic local energy. Reduces the inner ensemble {psi_p} into an effective
+  // local energy and overlap per outer walker,
+  //   E[w] = sum_p <psi_p|H|phi_w> / sum_p <psi_p|phi_w>,   Ov[w] = (1/P) sum_p <psi_p|phi_w>,
+  // the inner_nsteps = 0 specialization of Eq. 27 of arXiv:2505.18519 (B_T = 1, so the phase
+  // factor S(Y) and importance reweighting are degenerate). Ov[w] matches Phase 2a Overlap, and
+  // at the single-determinant delegate limit both E and Ov equal the NOMSD result. Mirrors
+  // NOMSD::Energy_shared with the trial-determinant loop replaced by the inner-walker loop and
+  // the CI weight conj(ci[nd]) replaced by 1/P. Definitions in StochasticWfn.icc.
   template<class WlkSet>
-  void Energy(WlkSet& wset)
-  {
-    nomsd_.Energy(wset);
-  }
+  void Energy(WlkSet& wset);
 
   template<class WlkSet, class Mat, class TVec>
-  void Energy(const WlkSet& wset, Mat&& E, TVec&& Ov)
-  {
-    nomsd_.Energy(wset, std::forward<Mat>(E), std::forward<TVec>(Ov));
-  }
+  void Energy(const WlkSet& wset, Mat&& E, TVec&& Ov);
 
   template<class WlkSet, class MatG>
   void MixedDensityMatrix(const WlkSet& wset, MatG&& G, bool compact = true, bool transpose = false)

@@ -32,6 +32,7 @@
 #include "AFQMC/Utilities/taskgroup.h"
 
 #include "AFQMC/Wavefunctions/detail/phmsd_impl.hpp"
+#include "AFQMC/HamiltonianOperations/full_g_estimators.hpp"
 
 namespace sfqmc
 {
@@ -137,7 +138,9 @@ public:
         Lakn(std::move(vak)),
         vn0(std::move(vn0_)),
         Twian_ph(iextensions<1u>{0},shared_allocator<SPComplexType>{TG.TG_local()}),
-        Swia_ph(iextensions<1u>{0},shared_allocator<ComplexType>{TG.TG_local()})
+        Swia_ph(iextensions<1u>{0},shared_allocator<ComplexType>{TG.TG_local()}),
+        Lank_full_flat_(iextensions<2u>{0, 0}, shared_allocator<SPComplexType>{TG.TG_local()}),
+        hij_full_flat_(iextensions<1u>{0}, shared_allocator<ComplexType>{TG.TG_local()})
   {
     local_nCV = Likn.size(1);
     TG.Node().barrier();
@@ -691,6 +694,103 @@ public:
     TG.TG_local().barrier();
   }
 
+  // Phase 3b (StochasticWfn): local energy from a FULL (un-rotated) mixed Green's function. energy()
+  // contracts the per-trial-determinant half-rotated Lank[nd]/haj[nd] against a COMPACT G in that
+  // determinant's occupied basis; once a stochastic inner walker leaves the trial anchor that nd = 0
+  // rotation no longer matches the cross-DM basis, so this contracts the full Cholesky Likn and the
+  // bare one-body hij against the full NMO x NMO cross G instead. It reuses the proven energy_impl
+  // contraction with the IDENTITY-rotated tensors (built once by ensure_full_cholesky), so it returns
+  // the same E1/EXX/EJ as energy() when the bra IS the anchor (validated by the energy_fullG-at-anchor
+  // test). Restricted to CLOSED (RHF) trials this phase; COLLINEAR/NONCOLLINEAR are a follow-up.
+  // G layout: [nwalk][NMO*NMO] (transposed_G_for_E()). E is partial per core (E0/E1 gated by addH1,
+  // EXX/EJ partitioned), matching how energy()/StochasticWfn::Energy all-reduce.
+  template<class Mat, class MatB>
+  void energy_fullG(Mat&& E, MatB const& Gfull, bool addH1 = true, bool addEJ = true, bool addEXX = true)
+  {
+    if (walker_type != CLOSED)
+      APP_ABORT("Error in Real3IndexFactorization::energy_fullG: Phase 3b un-rotated full-G energy "
+                "currently supports CLOSED (RHF) trials only (COLLINEAR/NONCOLLINEAR are a follow-up).");
+    ensure_full_cholesky(); // builds Lank_full_flat_ (identity-rotated Likn) + hij_full_flat_
+    full_g::energy_closed<SPComplexType>(TG, shm_buffer_manager, std::forward<Mat>(E), Gfull,
+                                         Lank_full_flat_, hij_full_flat_, local_nCV, E0, addH1, addEJ, addEXX);
+  }
+
+  // Phase 3b (StochasticWfn): force bias from a FULL (un-rotated) reduced Green's function. The single-
+  // determinant vbias() above uses the anchor's half-rotated Lakn; once inner walkers leave the anchor
+  // that is invalid, so this always contracts the full Cholesky Likn (the same contraction vbias() uses
+  // for multi-determinant trials, lines tagged "multideterminant is not half-rotated"), regardless of
+  // haj.size(0). G layout: [NMO*NMO][nwalk] (non-transposed). Restricted to CLOSED this phase.
+  template<class MatA,
+           class MatB,
+           typename = typename std::enable_if_t<(std::decay<MatA>::type::dimensionality == 2)>,
+           typename = typename std::enable_if_t<(std::decay<MatB>::type::dimensionality == 2)>>
+  void vbias_fullG(const MatA& G, MatB&& v, double dt, double a = 1., double c = 0.)
+  {
+    if (walker_type != CLOSED)
+      APP_ABORT("Error in Real3IndexFactorization::vbias_fullG: Phase 3b un-rotated full-G force bias "
+                "currently supports CLOSED (RHF) trials only (COLLINEAR/NONCOLLINEAR are a follow-up).");
+    using GType = typename std::decay_t<typename MatA::element>;
+    using vType = typename std::decay<MatB>::type::element;
+    a *= std::sqrt(dt);
+    long ic0, icN;
+    // setup buffer space if changing precision in G or v (mirrors vbias()).
+    size_t vmem(0), Gmem(0);
+    if (not std::is_same<GType, SPComplexType>::value)
+      Gmem = G.num_elements();
+    if (not std::is_same<vType, SPComplexType>::value)
+      vmem = v.num_elements();
+    ShmArray<SPComplexType, 1> buff(iextensions<1u>{vmem + Gmem},
+                shm_buffer_manager.get_generator().template get_allocator<SPComplexType>());
+    const_sp_pointer Gptr(nullptr);
+    sp_pointer vptr(nullptr);
+    if (std::is_same<GType, SPComplexType>::value)
+    {
+      Gptr = reinterpret_cast<const_sp_pointer>(raw_pointer_cast(G.origin()));
+    }
+    else
+    {
+      long i0, iN;
+      std::tie(i0, iN) =
+          FairDivideBoundary(long(TG.TG_local().rank()), long(G.size(0)), long(TG.TG_local().size()));
+      Array_ref<SPComplexType, 2> Gsp(raw_pointer_cast(buff.origin()), G.extensions());
+      if (iN > i0)
+        ma::copy_n_cast(G.sliced(i0, iN), Gsp.sliced(i0, iN));
+      Gptr = raw_pointer_cast(buff.origin());
+    }
+    if (std::is_same<vType, SPComplexType>::value)
+    {
+      vptr = reinterpret_cast<sp_pointer>(raw_pointer_cast(v.origin()));
+    }
+    else
+    {
+      long i0, iN;
+      std::tie(i0, iN) =
+          FairDivideBoundary(long(TG.TG_local().rank()), long(v.num_elements()), long(TG.TG_local().size()));
+      vptr = raw_pointer_cast(buff.origin()) + Gmem;
+      if (std::abs(c) > 1e-12)
+        copy_n_cast(raw_pointer_cast(v.origin()) + i0, iN - i0, vptr + i0);
+    }
+    multi::array_cref<SPComplexType const, 2> Gsp(Gptr, G.extensions());
+    multi::array_ref<SPComplexType, 2> vsp(vptr, v.extensions());
+    TG.TG_local().barrier();
+
+    // v(n,w) = sqrt(dt) * a * sum_ik Likn(ik,n) G(ik,w)  (full, un-rotated). CLOSED: a *= 2.
+    RUNTIME_CHECK(G.size(0) == Likn.size(0), "");
+    RUNTIME_CHECK(Likn.size(1) == v.size(0), "");
+    RUNTIME_CHECK(G.size(1) == v.size(1), "");
+    std::tie(ic0, icN) =
+        FairDivideBoundary(long(TG.TG_local().rank()), long(Likn.size(1)), long(TG.TG_local().size()));
+    a *= 2.0;
+    ma::product(SPRealType(a), ma::T(Likn(Likn.extension(0), {ic0, icN})), Gsp, SPRealType(c),
+                vsp.sliced(ic0, icN));
+
+    if (not std::is_same<vType, SPComplexType>::value)
+    {
+      copy_n_cast(raw_pointer_cast(vsp[ic0].origin()), vsp.size(1) * (icN - ic0), raw_pointer_cast(v[ic0].origin()));
+    }
+    TG.TG_local().barrier();
+  }
+
   template<class Mat, class MatB>
   void generalizedFockMatrix([[maybe_unused]] Mat&& G, [[maybe_unused]] MatB&& Fp, [[maybe_unused]] MatB&& Fm)
   {
@@ -751,6 +851,18 @@ private:
   shmSpCVector Twian_ph;
   // Swia = sum_k G_ref[w][i][k] h[a][k]
   shmCVector Swia_ph;
+
+  // Phase 3b (StochasticWfn): un-rotated full-G energy support. These are the IDENTITY half-rotation
+  // of the full Cholesky / bare one-body, i.e. they let energy_fullG reuse the proven energy_impl
+  // contraction structure with the full NMO x NMO cross G of a propagated inner walker (which has left
+  // the trial anchor, so the per-determinant Lank[nd]/haj[nd] no longer apply). Built lazily once by
+  // ensure_full_cholesky() and reused for all walkers/steps (NOT per-walker re-rotation).
+  //   Lank_full_flat_[(i,nc)][k] = Likn[(i,k)][nc]   (SP, the identity-rotated Lank, flattened, for EXX)
+  //   hij_full_flat_[(i,k)]      = hij[i][k]         (full-precision complex bare one-body, for E1)
+  // hij_full_flat_ is full precision (ComplexType) to match haj in energy_impl's E1 product; Lank_full_flat_
+  // is SP to match Lank in the EXX product (GF/Lan are SP). Mixing precisions in one ma::product would fail.
+  shmSpCMatrix Lank_full_flat_;
+  shmCVector hij_full_flat_;
 
   // Accumulates 1-Body and EXX energy components associated with spin ispin.
   // Accumulates KE vectors if requested. DOES NOT accumulate EJ.  
@@ -871,8 +983,39 @@ private:
     TG.TG_local().barrier();
   }
 
+  // Phase 3b: build the IDENTITY half-rotation of the full Cholesky / bare one-body, once. This lets
+  // the shared full_g::energy_closed kernel reuse the energy_impl contraction structure with the full G
+  // of a propagated inner walker. CPU build (root-only fill of the shared buffers, like
+  // WalkerSetBase::resize); GPU support is a deferred follow-up. Built lazily and reused for all
+  // walkers/steps (NOT per-walker re-rotation).
+  void ensure_full_cholesky()
+  {
+    if (Lank_full_flat_.size(0) > 0)
+      return; // already built
+    int NMO = hij.size(1);
+    // Reallocate the shared buffers (collective across TG_local).
+    //   Lank_full_flat_[(i,nc)][k] = Likn[(i,k)][nc]   (row i*local_nCV + nc -- matches Lank[..].flatted())
+    //   hij_full_flat_[(i,k)]      = hij[i][k]
+    Lank_full_flat_ = shmSpCMatrix(iextensions<2u>{long(NMO) * local_nCV, NMO},
+                                   shared_allocator<SPComplexType>{TG.TG_local()});
+    hij_full_flat_  = shmCVector(iextensions<1u>{long(NMO) * NMO},
+                                 shared_allocator<ComplexType>{TG.TG_local()});
+    if (TG.TG_local().root())
+    {
+      for (int i = 0; i < NMO; ++i)
+        for (int nc = 0; nc < local_nCV; ++nc)
+          for (int k = 0; k < NMO; ++k)
+            Lank_full_flat_[i * local_nCV + nc][k] =
+                SPComplexType(static_cast<SPRealType>(Likn[i * NMO + k][nc]), SPRealType(0));
+      for (int i = 0; i < NMO; ++i)
+        for (int k = 0; k < NMO; ++k)
+          hij_full_flat_[i * NMO + k] = ComplexType(hij[i][k]);
+    }
+    TG.TG_local().barrier(); // buffers are shared over TG_local; non-root cores wait for root's fill
+  }
+
   template<class Mat, class MatB, class MatC>
-  void ph_ref_energy_impl(int ispin, 
+  void ph_ref_energy_impl(int ispin,
               Mat&& E,
               MatB const& Gc,
               MatC& Kl,

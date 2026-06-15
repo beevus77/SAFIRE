@@ -33,6 +33,8 @@
 #include "Numerics/batched_operations.hpp"
 #include "Utilities/FairDivide.hpp"
 
+#include "AFQMC/HamiltonianOperations/full_g_estimators.hpp"
+
 namespace sfqmc
 {
 namespace afqmc
@@ -125,11 +127,15 @@ public:
         Lnak(move_vector<local_csr_Matrix<SpLakType, csrIndexType>>(std::move(vnT)))
 #if !defined(ENABLE_DEVICE)
 	,Likn_view(csr::shm::local_balanced_partition(Likn, TG))
-	,Lnik_view( use_Lnik ?  
+	,Lnik_view( use_Lnik ?
 		   csr::shm::local_balanced_partition(Lnik, TG) :
-		   Likn[std::array<size_t, 4>{0,1,0,Likn.size(1)}] 
+		   Likn[std::array<size_t, 4>{0,1,0,Likn.size(1)}]
 		 )
 #endif
+        // Phase 3b (StochasticWfn) un-rotated full-G support; built lazily by ensure_full_cholesky().
+        ,Lank_full_flat_(iextensions<2u>{0, 0}, shared_allocator<SPComplexType>{TG.TG_local()})
+        ,Lnc_dense_(iextensions<2u>{0, 0}, shared_allocator<SPComplexType>{TG.TG_local()})
+        ,hij_full_flat_(iextensions<1u>{0}, shared_allocator<ComplexType>{TG.TG_local()})
   {
     // right now, npol is assumed to be 1, but this is how it should be with SO enabled!
     // if NONCOLLINEAR, then npol = 2, nspin = 1 and ndn=nelec[1]=0
@@ -496,8 +502,71 @@ public:
         ma::copy_n_cast(v_.sliced(i0,iN), v.sliced(i0,iN));
       TG.TG_local().barrier();
     } else {
-      vbias_impl(G,v,dt,a,c); 
-    } 
+      vbias_impl(G,v,dt,a,c);
+    }
+  }
+
+  // Phase 3b (StochasticWfn): local energy from a FULL (un-rotated) mixed Green's function. energy()
+  // contracts the per-determinant half-rotated Vakbl[k]/Lnak[k]/haj[k] against a COMPACT G in det k's
+  // occupied basis; once a stochastic inner walker leaves the anchor that is invalid, so this contracts
+  // the full (densified) Cholesky and bare hij against the full NMO x NMO cross G via the shared kernel.
+  // CLOSED (RHF) trials only this phase. G layout: [nwalk][NMO*NMO] (transposed_G_for_E()).
+  template<class Mat, class MatB>
+  void energy_fullG(Mat&& E, MatB const& Gfull, bool addH1 = true, bool addEJ = true, bool addEXX = true)
+  {
+    if (walker_type != CLOSED)
+      APP_ABORT("Error in SparseTensor::energy_fullG: Phase 3b un-rotated full-G energy currently supports "
+                "CLOSED (RHF) trials only (COLLINEAR/NONCOLLINEAR are a follow-up).");
+    ensure_full_cholesky();
+    full_g::energy_closed<SPComplexType>(TG, localTG_buffer_manager, std::forward<Mat>(E), Gfull,
+                                         Lank_full_flat_, hij_full_flat_, int(Likn.size(1)), E0, addH1, addEJ, addEXX);
+  }
+
+  // Phase 3b (StochasticWfn): force bias from a FULL (un-rotated) reduced Green's function. vbias() uses
+  // the anchor's half-rotated Lnak[0]; once inner walkers leave the anchor that is invalid, so this
+  // contracts the full (densified) Cholesky: v[n][w] = sqrt(dt)*a * sum_ik L_ik^n G[ik][w]. CLOSED only.
+  // G layout: [NMO*NMO][nwalk] (non-transposed). Mirrors vbias()'s SP-precision dispatch.
+  template<class MatA,
+           class MatB,
+           typename = typename std::enable_if_t<(std::decay_t<MatA>::dimensionality == 2)>,
+           typename = typename std::enable_if_t<(std::decay_t<MatB>::dimensionality == 2)>>
+  void vbias_fullG(const MatA& G, MatB&& v, double dt, double a = 1., double c = 0.)
+  {
+    if (walker_type != CLOSED)
+      APP_ABORT("Error in SparseTensor::vbias_fullG: Phase 3b un-rotated full-G force bias currently supports "
+                "CLOSED (RHF) trials only (COLLINEAR/NONCOLLINEAR are a follow-up).");
+    ensure_full_cholesky();
+    using AType = typename std::decay_t<typename MatA::element_type>;
+    using BType = typename std::decay_t<MatB>::element_type;
+    if constexpr (not std::is_same_v<AType, SPComplexType>)
+    {
+      long i0, iN;
+      std::tie(i0, iN) = FairDivideBoundary(long(TG.getLocalTGRank()), long(G.size(0)), long(TG.getNCoresPerTG()));
+      ShmArray<SPComplexType, 2> G_(G.extensions(),
+                     localTG_buffer_manager.get_generator().template get_allocator<SPComplexType>());
+      if (iN > i0)
+        ma::copy_n_cast(G.sliced(i0, iN), G_.sliced(i0, iN));
+      TG.TG_local().barrier();
+      vbias_fullG(G_, std::forward<MatB>(v), dt, a, c);
+    }
+    else if constexpr (not std::is_same_v<BType, SPComplexType>)
+    {
+      long i0, iN;
+      std::tie(i0, iN) = FairDivideBoundary(long(TG.getLocalTGRank()), long(v.size(0)), long(TG.getNCoresPerTG()));
+      ShmArray<SPComplexType, 2> v_(v.extensions(),
+                     localTG_buffer_manager.get_generator().template get_allocator<SPComplexType>());
+      if (iN > i0 and std::abs(c) > 1e-12)
+        ma::copy_n_cast(v.sliced(i0, iN), v_.sliced(i0, iN));
+      TG.TG_local().barrier();
+      vbias_fullG_impl(G, v_, dt, a, c);
+      if (iN > i0)
+        ma::copy_n_cast(v_.sliced(i0, iN), v.sliced(i0, iN));
+      TG.TG_local().barrier();
+    }
+    else
+    {
+      vbias_fullG_impl(G, v, dt, a, c);
+    }
   }
 
   template<class Mat, class MatB>
@@ -575,6 +644,79 @@ private:
   std::vector<typename local_csr_Matrix<SpV2XType, csrIndexType>::template matrix_view<int>> Vakbl_view;
   std::vector<typename local_csr_Matrix<SpLakType, csrIndexType>::template matrix_view<int>> Lnak_view;
 #endif
+
+  // Phase 3b (StochasticWfn): un-rotated full-G support. Dense forms of the full Cholesky / bare
+  // one-body, built lazily by ensure_full_cholesky() (densifying the sparse Likn), reused for all
+  // walkers/steps. Mirror Real3IndexFactorization's members so the same shared full_g::energy_closed
+  // kernel works for both the dense and sparse Cholesky HamOps.
+  //   Lank_full_flat_[(i,nc)][k] = L_ik^nc  (SP, identity-rotated, flattened; for the EXX kernel)
+  //   Lnc_dense_[nc][i*NMO+k]    = L_ik^nc  (SP, [nchol][NMO*NMO]; for the vbias L.G contraction)
+  //   hij_full_flat_[(i,k)]      = hij[i][k] (full-precision; for E1)
+  boost::multi::array<SPComplexType, 2, shared_allocator<SPComplexType>> Lank_full_flat_;
+  boost::multi::array<SPComplexType, 2, shared_allocator<SPComplexType>> Lnc_dense_;
+  boost::multi::array<ComplexType, 1, shared_allocator<ComplexType>> hij_full_flat_;
+
+  // Phase 3b: build the dense full Cholesky / one-body from the sparse Likn, once. Matrix2MA is a local
+  // (non-collective) densification of the node-shared full Likn, so we densify on the TG_local root and
+  // fill the shared members, then barrier. CPU only (Phase 3b is gated to CPU at StochasticWfn ctor).
+  void ensure_full_cholesky()
+  {
+    if (Lank_full_flat_.size(0) > 0)
+      return; // already built
+    int npol  = (walker_type == NONCOLLINEAR ? 2 : 1);
+    int NMO   = hij.size(1) / npol;
+    int nchol = int(Likn.size(1));
+    Lank_full_flat_ = boost::multi::array<SPComplexType, 2, shared_allocator<SPComplexType>>(
+        iextensions<2u>{long(NMO) * nchol, NMO}, shared_allocator<SPComplexType>{TG.TG_local()});
+    Lnc_dense_ = boost::multi::array<SPComplexType, 2, shared_allocator<SPComplexType>>(
+        iextensions<2u>{nchol, long(NMO) * NMO}, shared_allocator<SPComplexType>{TG.TG_local()});
+    hij_full_flat_ = boost::multi::array<ComplexType, 1, shared_allocator<ComplexType>>(
+        iextensions<1u>{long(NMO) * NMO}, shared_allocator<ComplexType>{TG.TG_local()});
+    if (TG.TG_local().root())
+    {
+      // HSPot[nc][ik] = Likn[ik][nc] (full dense Cholesky), via the same densify getHSPotentials() uses.
+      boost::multi::array<ComplexType, 2> HSPot({Likn.size(1), Likn.size(0)});
+      ma::Matrix2MA('T', Likn, HSPot);
+      for (int nc = 0; nc < nchol; ++nc)
+        for (int ik = 0; ik < NMO * NMO; ++ik)
+          Lnc_dense_[nc][ik] =
+              SPComplexType(static_cast<SPRealType>(HSPot[nc][ik].real()), static_cast<SPRealType>(HSPot[nc][ik].imag()));
+      for (int i = 0; i < NMO; ++i)
+        for (int nc = 0; nc < nchol; ++nc)
+          for (int k = 0; k < NMO; ++k)
+          {
+            ComplexType L(HSPot[nc][i * NMO + k]);
+            Lank_full_flat_[i * nchol + nc][k] =
+                SPComplexType(static_cast<SPRealType>(L.real()), static_cast<SPRealType>(L.imag()));
+          }
+      for (int i = 0; i < NMO; ++i)
+        for (int k = 0; k < NMO; ++k)
+          hij_full_flat_[i * NMO + k] = ComplexType(hij[i][k]);
+    }
+    TG.TG_local().barrier();
+  }
+
+  // Phase 3b: v[n][w] = sqrt(dt)*a * sum_ik L_ik^n G[ik][w] from the dense full Cholesky (CLOSED: *2,
+  // matching vbias_impl). G/v are SPComplexType here (vbias_fullG handles the precision casting).
+  // Partitioned over the nchol rows of v (each core writes its band), like the half-rotated vbias.
+  template<class MatA, class MatB>
+  void vbias_fullG_impl(MatA&& G, MatB&& v, double dt, double a, double c)
+  {
+    static_assert(std::decay_t<MatA>::dimensionality == 2, "Wrong dimensionality");
+    static_assert(std::decay_t<MatB>::dimensionality == 2, "Wrong dimensionality");
+    a *= std::sqrt(dt);
+    a *= 2.0; // CLOSED
+    RUNTIME_CHECK(G.size(0) == Lnc_dense_.size(1), "");  // NMO*NMO
+    RUNTIME_CHECK(v.size(0) == Lnc_dense_.size(0), "");  // nchol
+    RUNTIME_CHECK(v.size(1) == G.size(1), "");           // nwalk
+    long n0, nN;
+    std::tie(n0, nN) =
+        FairDivideBoundary(long(TG.TG_local().rank()), long(Lnc_dense_.size(0)), long(TG.TG_local().size()));
+    if (nN > n0)
+      ma::product(SPComplexType(SPRealType(a)), Lnc_dense_.sliced(n0, nN), G, SPComplexType(SPRealType(c)),
+                  v.sliced(n0, nN));
+    TG.TG_local().barrier();
+  }
 
   template<class MatA, class MatB>
   void vbias_impl(MatA&& G, MatB&& v, double dt, double a, double c)

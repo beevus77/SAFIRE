@@ -156,7 +156,7 @@ public:
       APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps must be >= 0.");
     if (inner_nsteps > 0)
       APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps > 0 not yet supported "
-                "(inner propagation arrives with Phase 2+; the Phase 1c ensemble is static).");
+                "(inner propagation arrives with Phase 3b; the Phase 1c–3a ensemble is static).");
     int inner_seed = pt0.get<int>("inner_seed", 777);
     pt1.put("inner_nwalkers", inner_nwalkers);
     pt1.put("inner_nsteps", inner_nsteps);
@@ -267,6 +267,12 @@ public:
     return nomsd_.vHS_sparse(std::forward<Args>(args)...);
   }
 
+  // Phase 3a: force bias. The L*G contraction is trial-independent given G, so this stays a
+  // permanent delegate to the OUTER nomsd_ (the True Hamiltonian). What makes it stochastic is its
+  // input: MixedDensityMatrix_for_vbias now feeds the inner-ensemble-reduced G[w] (estimator 4,
+  // x_gamma[w] = L_gamma . G[w]), and nomsd_.vbias contracts it against the True-Ham Cholesky with
+  // the nd = 0 static-anchor half-rotation (no per-determinant nd in vbias). The sqrt(dt)/timestep
+  // prefactor stays in the propagator. See StochasticDevelopment.md (Phase 3a).
   template<class MatG, class MatA>
   void vbias(const MatG& G, MatA&& v, double dt, double a = 1.0)
   {
@@ -319,11 +325,17 @@ public:
                         std::forward<TVec>(Ov), herm, compact, transposed);
   }
 
+  // Phase 3a: stochastic mixed density matrix for the force bias. Reduces the inner ensemble {psi_p}
+  // into the effective mixed DM each outer walker's force bias contracts against,
+  //   G[w] = sum_p <psi_p|c^dag c|phi_w> / sum_p <psi_p|phi_w>   (estimator 3 of arXiv:2505.18519),
+  // the inner_nsteps = 0 specialization (B_T = 1, so the phase factor S(Y) and importance reweighting
+  // are degenerate). Returned in the OUTER nomsd_ vbias layout so the unchanged vbias delegate can
+  // contract it. Mirrors NOMSD::MixedDensityMatrix_shared's accumulate-then-normalize with the
+  // trial-determinant loop replaced by the inner-walker loop and conj(ci[nd]) replaced by 1/P; the
+  // 1/P cancels, so G[w]'s overlap normalization matches the Phase 2a/2b Ov. At the single-determinant
+  // delegate limit G[w] equals the NOMSD result. Definition in StochasticWfn.icc.
   template<class WlkSet, class MatG>
-  void MixedDensityMatrix_for_vbias(const WlkSet& wset, MatG&& G)
-  {
-    nomsd_.MixedDensityMatrix_for_vbias(wset, std::forward<MatG>(G));
-  }
+  void MixedDensityMatrix_for_vbias(const WlkSet& wset, MatG&& G);
 
   // Phase 2a: stochastic trial overlap. Reduces the inner ensemble {psi_p} into an
   // effective overlap per outer walker, Ov[w] = (1/P) sum_p <psi_p | phi_w>, following

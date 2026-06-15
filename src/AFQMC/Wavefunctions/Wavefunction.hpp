@@ -497,6 +497,20 @@ public:
         *this);
   }
 
+  // Phase 3b: arm the StochasticWfn per-outer-step inner-ensemble resample latch. No-op for plain
+  // NOMSD/PHMSD. AFQMCBasePropagator::step calls this at the top of each step so the inner ensemble
+  // is resampled exactly once per outer step (the first reduction that runs consumes the latch).
+  void begin_inner_step()
+  {
+    boost::apply_visitor(
+        [](auto&& a) {
+          using Wfn = std::decay_t<decltype(a)>;
+          if constexpr (wavefunction_detail::is_stochastic_wfn<Wfn>::value)
+            a.begin_inner_step();
+        },
+        *this);
+  }
+
   WalkerSet& stochastic_inner_wset()
   {
     if (not is_stochastic_wavefunction())

@@ -39,6 +39,10 @@ template<bool SP>
 template<class WlkSet>
 void AFQMCDistributedPropagatorDistCV<SP>::step(int nsteps_, WlkSet& wset, RealType Eshift, RealType dt)
 {
+  // Phase 3b: arm the stochastic-trial inner-ensemble resample latch (no-op unless wfn is a
+  // StochasticWfn with inner_nsteps > 0). The stochastic reductions abort for distributed Cholesky
+  // (NGroupsPerTG > 1), so this latch is moot here; armed for completeness. See AFQMCBasePropagator::step.
+  wfn.begin_inner_step();
   using std::copy_n;
   AFQMCTimer.start(setup_timer);
   const SPComplexType one(1.), zero(0.);

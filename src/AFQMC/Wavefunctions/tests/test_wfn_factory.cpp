@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 #include <complex>
+#include <cmath>
 #include <iomanip>
 #include <random>
 
@@ -1212,6 +1213,116 @@ void stochastic_vbias_matches_nomsd(boost::mpi3::communicator& world)
   ctx.TG.Global().barrier();
 }
 
+// Phase 3b: validate the un-rotated full-G energy/force-bias kernels (energy_fullG / vbias_fullG,
+// taken when inner_nsteps > 0) against the proven compact nd = 0 path (inner_nsteps = 0) and NOMSD.
+// Trick: build a stochastic trial with inner_nsteps = 1 but never call begin_inner_step(), so the inner
+// ensemble is never resampled and the inner walkers stay at the anchor |phi_T>. The reductions still
+// take the full-G code path (gated on inner_nsteps_ > 0), so this isolates the new kernels at the
+// anchor, where they must reproduce the compact path exactly. CLOSED (RHF) trials only this phase (the
+// full-G kernels abort otherwise), so the test is a no-op for COLLINEAR/NONCOLLINEAR inputs.
+template<bool MP, class Allocator>
+void stochastic_full_g_matches_compact(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_HAMIL) || not file_exists(UTEST_WFN))
+    APP_ABORT(" Hamiltonian or wavefunction file not found. Run unit test with --hamil /path/to/hamil.h5 and --wfn /path/to/wfn.h5.");
+  if (afqmc::getWavefunctionType(UTEST_WFN) != "NOMSD")
+    return;
+
+  WfnTestContext<MP, Allocator> ctx(world);
+  if (ctx.type != CLOSED)
+    return; // Phase 3b un-rotated full-G kernels support CLOSED (RHF) trials only.
+
+  auto make_dyn_pt = [&](const std::string& name, int inner_nwalkers, int inner_nsteps) {
+    ptree pt = ctx.make_wfn_pt(name, UTEST_WFN, true, inner_nwalkers);
+    pt.put("inner_nsteps", inner_nsteps);
+    return pt;
+  };
+
+  Wavefunction& wfn_nomsd =
+      ctx.register_wavefunction("wfn_nomsd_fg", ctx.make_wfn_pt("wfn_nomsd_fg", UTEST_WFN, false));
+  Wavefunction& wfn_compact = // inner_nsteps = 0 -> compact nd = 0 half-rotated path (Phase 3a)
+      ctx.register_wavefunction("wfn_stoch_fg0", ctx.make_wfn_pt("wfn_stoch_fg0", UTEST_WFN, true, 1));
+  Wavefunction& wfn_full = // inner_nsteps = 1 -> un-rotated full-G path; NOT propagated (no begin_inner_step)
+      ctx.register_wavefunction("wfn_stoch_fg1", make_dyn_pt("wfn_stoch_fg1", 1, 1));
+
+  // ---- Energy: full-G at the anchor == compact nd = 0 == NOMSD (single-determinant delegate limit) ----
+  struct WalkerEnergies { std::vector<ComplexType> ov, E1, EXX, EJ, Etot; };
+  auto collect_energies = [&](Wavefunction& wfn) {
+    WalkerSet wset = ctx.make_walker_set();
+    ctx.init_walkers(wset, "wfn_nomsd_fg");
+    wfn.Energy(wset);
+    ctx.TG.TG_local().barrier();
+    WalkerEnergies out;
+    for (auto it = wset.begin(); it != wset.end(); ++it)
+    {
+      out.ov.push_back(ComplexType(*it->overlap()));
+      out.E1.push_back(ComplexType(*it->E1()));
+      out.EXX.push_back(ComplexType(*it->EXX()));
+      out.EJ.push_back(ComplexType(*it->EJ()));
+      out.Etot.push_back(ComplexType(it->energy()));
+    }
+    return out;
+  };
+  WalkerEnergies ref  = collect_energies(wfn_nomsd);
+  WalkerEnergies comp = collect_energies(wfn_compact);
+  WalkerEnergies full = collect_energies(wfn_full);
+  REQUIRE(full.ov.size() == comp.ov.size());
+
+  const bool single_det = (wfn_nomsd.number_of_references_for_back_propagation() == 1);
+  for (int n = 0; n < static_cast<int>(full.ov.size()); ++n)
+  {
+    // full-G energy (E1, EXX, EJ, total) at the anchor equals the compact nd = 0 energy.
+    REQUIRE(real(full.E1[n]) == Approx(real(comp.E1[n])));
+    REQUIRE(real(full.EXX[n]) == Approx(real(comp.EXX[n])));
+    REQUIRE(real(full.EJ[n]) == Approx(real(comp.EJ[n])));
+    REQUIRE(real(full.Etot[n]) == Approx(real(comp.Etot[n])));
+    REQUIRE(imag(full.Etot[n]) == Approx(imag(comp.Etot[n])));
+    // Overlap is the absolute reduction (layout-independent), so it matches too.
+    REQUIRE(real(full.ov[n]) == Approx(real(comp.ov[n])));
+    REQUIRE(imag(full.ov[n]) == Approx(imag(comp.ov[n])));
+    if (single_det) // delegate limit: anchor == trial determinant, so full-G energy == NOMSD.
+    {
+      REQUIRE(real(full.E1[n]) == Approx(real(ref.E1[n])));
+      REQUIRE(real(full.EXX[n]) == Approx(real(ref.EXX[n])));
+      REQUIRE(real(full.EJ[n]) == Approx(real(ref.EJ[n])));
+      REQUIRE(real(full.Etot[n]) == Approx(real(ref.Etot[n])));
+    }
+  }
+
+  // ---- Force bias: the full-Likn contraction at the anchor == the compact half-rotated one ----
+  // Compare the bias x = L.G (layout [nCV][nwalk] in both cases), not G (whose layout differs).
+  using CMatrix = Matrix_<Allocator>;
+  const double dt(0.01);
+  auto collect_vbias = [&](Wavefunction& wfn) {
+    auto size_of_G = wfn.size_of_G_for_vbias();
+    int Gdim1      = (wfn.transposed_G_for_vbias() ? ctx.nwalk : size_of_G);
+    int Gdim2      = (wfn.transposed_G_for_vbias() ? size_of_G : ctx.nwalk);
+    auto nCV       = wfn.local_number_of_cholesky_vectors();
+    WalkerSet wset = ctx.make_walker_set();
+    ctx.init_walkers(wset, "wfn_nomsd_fg");
+    CMatrix G({Gdim1, Gdim2}, ctx.alloc_);
+    wfn.MixedDensityMatrix_for_vbias(wset, G);
+    CMatrix X({nCV, ctx.nwalk}, ctx.alloc_);
+    wfn.vbias(G, X, dt);
+    ctx.TG.TG_local().barrier();
+    std::vector<ComplexType> Xf;
+    for (int i = 0; i < X.size(0); ++i)
+      for (int j = 0; j < X.size(1); ++j)
+        Xf.push_back(ComplexType(X[i][j]));
+    return Xf;
+  };
+  auto Xcomp = collect_vbias(wfn_compact);
+  auto Xfull = collect_vbias(wfn_full);
+  REQUIRE(Xfull.size() == Xcomp.size());
+  for (int n = 0; n < static_cast<int>(Xfull.size()); ++n)
+  {
+    REQUIRE(real(Xfull[n]) == Approx(real(Xcomp[n])));
+    REQUIRE(imag(Xfull[n]) == Approx(imag(Xcomp[n])));
+  }
+
+  ctx.TG.Global().barrier();
+}
+
 template<bool MP, class Allocator>
 void wfn_fac_distributed(boost::mpi3::communicator& world, int ngroups)
 {
@@ -1963,6 +2074,25 @@ TEST_CASE("stochastic_vbias_matches_nomsd", "[wavefunction_factory][stochastic_w
 
   stochastic_vbias_matches_nomsd<false, Alloc>(world);
   stochastic_vbias_matches_nomsd<true, Alloc>(world);
+  release_memory_managers();
+}
+
+TEST_CASE("stochastic_full_g_matches_compact", "[wavefunction_factory][stochastic_wfn]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto node  = world.split_shared(world.rank());
+  setup_loggers(world.root(), 2, 2);
+
+#if defined(ENABLE_DEVICE)
+  arch::INIT(node);
+  using Alloc = device::device_allocator<ComplexType>;
+#else
+  using Alloc = shared_allocator<ComplexType>;
+#endif
+  setup_memory_managers(node, 10uL * 1024uL * 1024uL);
+
+  stochastic_full_g_matches_compact<false, Alloc>(world);
+  stochastic_full_g_matches_compact<true, Alloc>(world);
   release_memory_managers();
 }
 

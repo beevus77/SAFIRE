@@ -627,11 +627,11 @@ void stochastic_wfn_matches_nomsd(boost::mpi3::communicator& world)
   ctx.TG.TG_local().barrier();
 
   REQUIRE(wset_stoch.size() == ov_ref.size());
-  // Overlap (Phase 2a) and Energy (Phase 2b) reduce a single-determinant inner ensemble, so they
-  // equal NOMSD only at the single-determinant delegate limit; a multi-determinant trial diverges
-  // by design (see StochasticDevelopment.md and the dedicated stochastic_overlap_matches_nomsd /
-  // stochastic_energy_matches_nomsd tests). Gate on ndet == 1. The MixedDensityMatrix_for_vbias /
-  // vbias comparisons below still delegate to nomsd_ (Phase 3) and stay unconditional.
+  // Overlap (Phase 2a), Energy (Phase 2b), and MixedDensityMatrix_for_vbias / vbias (Phase 3a) all
+  // reduce a single-determinant inner ensemble, so they equal NOMSD only at the single-determinant
+  // delegate limit; a multi-determinant trial diverges by design (see StochasticDevelopment.md and the
+  // dedicated stochastic_overlap_matches_nomsd / stochastic_energy_matches_nomsd /
+  // stochastic_vbias_matches_nomsd tests). All NOMSD-equality assertions are gated on ndet == 1.
   if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
   {
     for (int n = 0; n < static_cast<int>(ov_ref.size()); ++n)
@@ -649,26 +649,30 @@ void stochastic_wfn_matches_nomsd(boost::mpi3::communicator& world)
     }
   }
 
+  // Compute the stochastic mixed DM + force bias unconditionally (exercises the Phase 3a override and
+  // its layout/runtime handling on any trial), but compare to NOMSD only at the delegate limit.
   CMatrix G_stoch({Gdim1, Gdim2}, ctx.alloc_);
   wfn_stoch.MixedDensityMatrix_for_vbias(wset_stoch, G_stoch);
-  for (int i = 0; i < G_stoch.size(0); ++i)
-    for (int j = 0; j < G_stoch.size(1); ++j)
-    {
-      REQUIRE(real(ComplexType(G_stoch[i][j])) == Approx(real(ComplexType(G_nomsd[i][j]))));
-      REQUIRE(imag(ComplexType(G_stoch[i][j])) == Approx(imag(ComplexType(G_nomsd[i][j]))));
-    }
-
   ctx.maybe_init_model_ham(wfn_stoch, dt);
   CMatrix X_stoch({nCV, ctx.nwalk}, ctx.alloc_);
   wfn_stoch.vbias(G_stoch, X_stoch, dt);
   ctx.TG.TG_local().barrier();
 
-  for (int i = 0; i < X_stoch.size(0); ++i)
-    for (int j = 0; j < X_stoch.size(1); ++j)
-    {
-      REQUIRE(real(ComplexType(X_stoch[i][j])) == Approx(real(ComplexType(X_nomsd[i][j]))));
-      REQUIRE(imag(ComplexType(X_stoch[i][j])) == Approx(imag(ComplexType(X_nomsd[i][j]))));
-    }
+  if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
+  {
+    for (int i = 0; i < G_stoch.size(0); ++i)
+      for (int j = 0; j < G_stoch.size(1); ++j)
+      {
+        REQUIRE(real(ComplexType(G_stoch[i][j])) == Approx(real(ComplexType(G_nomsd[i][j]))));
+        REQUIRE(imag(ComplexType(G_stoch[i][j])) == Approx(imag(ComplexType(G_nomsd[i][j]))));
+      }
+    for (int i = 0; i < X_stoch.size(0); ++i)
+      for (int j = 0; j < X_stoch.size(1); ++j)
+      {
+        REQUIRE(real(ComplexType(X_stoch[i][j])) == Approx(real(ComplexType(X_nomsd[i][j]))));
+        REQUIRE(imag(ComplexType(X_stoch[i][j])) == Approx(imag(ComplexType(X_nomsd[i][j]))));
+      }
+  }
 
   ctx.TG.Global().barrier();
 }
@@ -1101,6 +1105,107 @@ void stochastic_energy_matches_nomsd(boost::mpi3::communicator& world)
       REQUIRE(real(ComplexType(E_direct[n][0])) == Approx(real(s1.E1[n])));
       REQUIRE(real(ComplexType(E_direct[n][1])) == Approx(real(s1.EXX[n])));
       REQUIRE(real(ComplexType(E_direct[n][2])) == Approx(real(s1.EJ[n])));
+    }
+  }
+
+  ctx.TG.Global().barrier();
+}
+
+// Phase 3a: the overridden StochasticWfn::MixedDensityMatrix_for_vbias reduces the inner ensemble
+// into the effective mixed density matrix the force bias contracts against (estimator 3 of
+// arXiv:2505.18519, static-ensemble limit), and StochasticWfn::vbias contracts it (estimator 4,
+// x_gamma[w] = L_gamma . G[w]) against the True-Ham Cholesky. Mirrors stochastic_energy_matches_nomsd.
+// Verifies:
+//   (1) inner_nwalkers invariance -- a static replicated ensemble (inner_nsteps = 0) gives a mixed DM
+//       G[w] and force bias x[w] independent of inner_nwalkers;
+//   (2) delegate limit -- for a single-determinant trial the stochastic G and force bias equal the
+//       NOMSD result exactly. Multi-determinant trials (e.g. wfn_msd.h5) intentionally diverge -- a
+//       single-determinant inner ensemble cannot reproduce the CI-weighted NOMSD DM -- so that
+//       assertion is gated on ndet == 1.
+template<bool MP, class Allocator>
+void stochastic_vbias_matches_nomsd(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_HAMIL) || not file_exists(UTEST_WFN))
+    APP_ABORT(" Hamiltonian or wavefunction file not found. Run unit test with --hamil /path/to/hamil.h5 and --wfn /path/to/wfn.h5.");
+  if (afqmc::getWavefunctionType(UTEST_WFN) != "NOMSD")
+    return;
+
+  WfnTestContext<MP, Allocator> ctx(world);
+  Wavefunction& wfn_nomsd =
+      ctx.register_wavefunction("wfn_nomsd_vb", ctx.make_wfn_pt("wfn_nomsd_vb", UTEST_WFN, false));
+  Wavefunction& wfn_s1 =
+      ctx.register_wavefunction("wfn_stoch_vb1", ctx.make_wfn_pt("wfn_stoch_vb1", UTEST_WFN, true, 1));
+  Wavefunction& wfn_s3 =
+      ctx.register_wavefunction("wfn_stoch_vb3", ctx.make_wfn_pt("wfn_stoch_vb3", UTEST_WFN, true, 3));
+
+  using CMatrix = Matrix_<Allocator>;
+  const double dt(0.01);
+
+  struct VbiasResult
+  {
+    std::vector<ComplexType> G, X;
+  };
+  // Reduce the (static) stochastic mixed DM into the vbias layout, then contract it into the force
+  // bias, returning both flattened for elementwise comparison.
+  auto collect_vbias = [&](Wavefunction& wfn, const std::string& guess_id) {
+    auto size_of_G = wfn.size_of_G_for_vbias();
+    int Gdim1      = (wfn.transposed_G_for_vbias() ? ctx.nwalk : size_of_G);
+    int Gdim2      = (wfn.transposed_G_for_vbias() ? size_of_G : ctx.nwalk);
+    auto nCV       = wfn.local_number_of_cholesky_vectors();
+
+    WalkerSet wset = ctx.make_walker_set();
+    ctx.init_walkers(wset, guess_id);
+
+    CMatrix G({Gdim1, Gdim2}, ctx.alloc_);
+    wfn.MixedDensityMatrix_for_vbias(wset, G);
+    ctx.maybe_init_model_ham(wfn, dt);
+    CMatrix X({nCV, ctx.nwalk}, ctx.alloc_);
+    wfn.vbias(G, X, dt);
+    ctx.TG.TG_local().barrier();
+
+    VbiasResult out;
+    for (int i = 0; i < G.size(0); ++i)
+      for (int j = 0; j < G.size(1); ++j)
+        out.G.push_back(ComplexType(G[i][j]));
+    for (int i = 0; i < X.size(0); ++i)
+      for (int j = 0; j < X.size(1); ++j)
+        out.X.push_back(ComplexType(X[i][j]));
+    return out;
+  };
+
+  VbiasResult ref = collect_vbias(wfn_nomsd, "wfn_nomsd_vb");
+  VbiasResult s1  = collect_vbias(wfn_s1, "wfn_nomsd_vb");
+  VbiasResult s3  = collect_vbias(wfn_s3, "wfn_nomsd_vb");
+
+  REQUIRE(s1.G.size() == ref.G.size());
+  REQUIRE(s3.G.size() == ref.G.size());
+  REQUIRE(s1.X.size() == ref.X.size());
+  REQUIRE(s3.X.size() == ref.X.size());
+
+  // (1) inner_nwalkers invariance: a static replicated ensemble gives identical G and force bias.
+  for (int n = 0; n < static_cast<int>(s1.G.size()); ++n)
+  {
+    REQUIRE(real(s3.G[n]) == Approx(real(s1.G[n])));
+    REQUIRE(imag(s3.G[n]) == Approx(imag(s1.G[n])));
+  }
+  for (int n = 0; n < static_cast<int>(s1.X.size()); ++n)
+  {
+    REQUIRE(real(s3.X[n]) == Approx(real(s1.X[n])));
+    REQUIRE(imag(s3.X[n]) == Approx(imag(s1.X[n])));
+  }
+
+  // (2) delegate limit: single-determinant trial => stochastic G and force bias == NOMSD.
+  if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
+  {
+    for (int n = 0; n < static_cast<int>(s1.G.size()); ++n)
+    {
+      REQUIRE(real(s1.G[n]) == Approx(real(ref.G[n])));
+      REQUIRE(imag(s1.G[n]) == Approx(imag(ref.G[n])));
+    }
+    for (int n = 0; n < static_cast<int>(s1.X.size()); ++n)
+    {
+      REQUIRE(real(s1.X[n]) == Approx(real(ref.X[n])));
+      REQUIRE(imag(s1.X[n]) == Approx(imag(ref.X[n])));
     }
   }
 
@@ -1839,6 +1944,25 @@ TEST_CASE("stochastic_energy_matches_nomsd", "[wavefunction_factory][stochastic_
 
   stochastic_energy_matches_nomsd<false, Alloc>(world);
   stochastic_energy_matches_nomsd<true, Alloc>(world);
+  release_memory_managers();
+}
+
+TEST_CASE("stochastic_vbias_matches_nomsd", "[wavefunction_factory][stochastic_wfn]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto node  = world.split_shared(world.rank());
+  setup_loggers(world.root(), 2, 2);
+
+#if defined(ENABLE_DEVICE)
+  arch::INIT(node);
+  using Alloc = device::device_allocator<ComplexType>;
+#else
+  using Alloc = shared_allocator<ComplexType>;
+#endif
+  setup_memory_managers(node, 10uL * 1024uL * 1024uL);
+
+  stochastic_vbias_matches_nomsd<false, Alloc>(world);
+  stochastic_vbias_matches_nomsd<true, Alloc>(world);
   release_memory_managers();
 }
 

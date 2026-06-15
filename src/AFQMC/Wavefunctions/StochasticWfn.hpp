@@ -106,6 +106,13 @@ class StochasticWfn : public AFQMCInfo
   StochasticInnerEnsemble inner_ensemble_;
   int inner_nwalkers_{1};
   int inner_nsteps_{0};
+  double inner_timestep_{0.01}; // dt for the inner free-projection B_T step (Phase 3b)
+  // Phase 3b latch: armed by begin_inner_step() at the top of each outer propagator step, consumed
+  // (cleared) by maybe_advance_inner_ensemble() the first time a reduction runs that step, so the
+  // inner ensemble is resampled exactly once per outer step regardless of which reductions are called.
+  bool inner_step_pending_{false};
+  // Anchor Slater matrices |phi_T> the inner walkers are reset to before each resample (Phase 3b).
+  boost::multi::array<ComplexType, 3> inner_anchor_;
   DeviceBufferManager buffer_manager;
   LocalTGBufferManager shm_buffer_manager;
   NOMSD<MP, devPsiT> nomsd_;
@@ -142,6 +149,25 @@ public:
     ptree pt = interpret_inputs(pt_in);
     inner_nwalkers_ = pt.get<int>("inner_nwalkers");
     inner_nsteps_   = pt.get<int>("inner_nsteps");
+    // The inner free-projection step's timestep comes from the inner_propagator subtree (the same
+    // block PropagatorFactory consumes); default 0.01. Only used when inner_nsteps_ > 0 (Phase 3b).
+    // The inner propagator (Propagate -> generateP1) rebuilds its one-body/CV scaling for this dt on
+    // first use (old_dt starts unset), so inner_timestep_ is the single effective source -- no drift.
+    if (auto prop_pt = pt.get_child_optional("inner_propagator"))
+      inner_timestep_ = prop_pt->get<double>("timestep", 0.01);
+    // Phase 3b fail-fast: the dynamic ensemble (inner_nsteps_ > 0) scores moving inner walkers via the
+    // un-rotated full-G energy/force bias, implemented for CLOSED (RHF) trials on CPU only. Reject early
+    // (here) rather than deep in the first reduction's HamOp dispatch.
+    if (inner_nsteps_ > 0)
+    {
+      if (wlk != CLOSED)
+        APP_ABORT("Error in StochasticWfn: inner_nsteps > 0 (dynamic stochastic trial) currently supports "
+                  "CLOSED (RHF) trials only -- COLLINEAR/NONCOLLINEAR full-G is a follow-up.");
+#if defined(ENABLE_DEVICE)
+      APP_ABORT("Error in StochasticWfn: inner_nsteps > 0 (dynamic stochastic trial) is CPU-only; the "
+                "un-rotated full-G kernels are not yet implemented for device builds.");
+#endif
+    }
     app_log(2, "\nStochasticWfn input:\n{}\n", io::to_string(pt));
   }
 
@@ -154,9 +180,7 @@ public:
     int inner_nsteps = pt0.get<int>("inner_nsteps", 0);
     if (inner_nsteps < 0)
       APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps must be >= 0.");
-    if (inner_nsteps > 0)
-      APP_ABORT("Error in StochasticWfn::interpret_inputs: inner_nsteps > 0 not yet supported "
-                "(inner propagation arrives with Phase 3b; the Phase 1c–3a ensemble is static).");
+    // Phase 3b: inner_nsteps > 0 drives the inner free-projection propagator (dynamic ensemble).
     int inner_seed = pt0.get<int>("inner_seed", 777);
     pt1.put("inner_nwalkers", inner_nwalkers);
     pt1.put("inner_nsteps", inner_nsteps);
@@ -211,6 +235,12 @@ public:
   Propagator& inner_propagator();
   Propagator const& inner_propagator() const;
 
+  // Phase 3b: arm the per-outer-step latch. The outer propagator (AFQMCBasePropagator::step) calls
+  // this at the top of each step; the first reduction that runs then resamples the inner ensemble
+  // (reset to anchor + inner_nsteps free-projection B_T steps) exactly once. No-op when
+  // inner_nsteps_ == 0 (static ensemble) since maybe_advance_inner_ensemble() ignores the latch then.
+  void begin_inner_step() { inner_step_pending_ = true; }
+
   NOMSD<MP, devPsiT>& outer_nomsd() { return nomsd_; }
   NOMSD<MP, devPsiT> const& outer_nomsd() const { return nomsd_; }
 
@@ -220,9 +250,20 @@ public:
   bool distribution_over_cholesky_vectors() const { return nomsd_.distribution_over_cholesky_vectors(); }
   bool spin_dependent_vHS() const { return nomsd_.spin_dependent_vHS(); }
 
-  int size_of_G_for_vbias() const { return nomsd_.size_of_G_for_vbias(); }
+  // Phase 3b: once inner walkers leave the anchor (inner_nsteps_ > 0) the True-Ham force bias can no
+  // longer use the nd = 0 half-rotated (compact) layout, so MixedDensityMatrix_for_vbias produces the
+  // FULL cross G [NMO*NMO][nwalk] (non-transposed) that vbias_fullG contracts with the full Likn. The
+  // outer propagator sizes its vbias G buffer from these, so they must advertise the full layout then.
+  // At inner_nsteps_ == 0 they stay the outer nomsd_ (compact/half-rotated) layout (Phase 3a, exact).
+  int size_of_G_for_vbias() const
+  {
+    return (inner_nsteps_ > 0) ? nomsd_.dm_size(true) : nomsd_.size_of_G_for_vbias();
+  }
 
-  bool transposed_G_for_vbias() const { return nomsd_.transposed_G_for_vbias(); }
+  bool transposed_G_for_vbias() const
+  {
+    return (inner_nsteps_ > 0) ? false : nomsd_.transposed_G_for_vbias();
+  }
   bool transposed_G_for_E() const { return nomsd_.transposed_G_for_E(); }
   bool transposed_vHS() const { return nomsd_.transposed_vHS(); }
   WALKER_TYPES getWalkerType() const { return nomsd_.getWalkerType(); }
@@ -276,7 +317,13 @@ public:
   template<class MatG, class MatA>
   void vbias(const MatG& G, MatA&& v, double dt, double a = 1.0)
   {
-    nomsd_.vbias(G, std::forward<MatA>(v), dt, a);
+    // Phase 3b: when the inner ensemble is dynamic, MixedDensityMatrix_for_vbias hands us the FULL
+    // reduced G, so contract it against the full (un-rotated) True-Ham Cholesky via vbias_fullG.
+    // Static limit (inner_nsteps_ == 0): the compact nd = 0 half-rotated delegate (Phase 3a).
+    if (inner_nsteps_ > 0)
+      nomsd_.vbias_fullG(G, std::forward<MatA>(v), dt, a);
+    else
+      nomsd_.vbias(G, std::forward<MatA>(v), dt, a);
   }
 
   template<class MatX, class MatA>
@@ -368,6 +415,31 @@ public:
   {
     nomsd_.getReferencesForBackPropagation(std::forward<Mat>(A));
   }
+
+private:
+  // Phase 3b: if the latch is armed and inner_nsteps_ > 0, reset the inner walkers to the anchor
+  // |phi_T> and apply inner_nsteps_ free-projection B_T steps (fresh Gaussian fields), producing a
+  // new walker-independent single-step ensemble {psi_p = B_T(Y^[p])|phi_T>}. Clears the latch.
+  // No-op when inner_nsteps_ == 0 (the static Phase 1c-3a ensemble). Defined in StochasticWfn.icc
+  // (needs the complete Propagator type).
+  void maybe_advance_inner_ensemble();
+
+  // Phase 3b: shared per-inner-walker cross-DM reduction used by Energy (2b) and
+  // MixedDensityMatrix_for_vbias (3a). For each inner walker psi_p it forms the cross mixed DM Gp and
+  // overlap ov_ = <psi_p|phi_w> against every outer walker (via nomsd_.DensityMatrix(..., herm=false)
+  // in the requested compact/transposed layout), computes the phase weight Sp[w] = ov_[w]/|ov_[w]|
+  // (Eq. 26), accumulates the denominator D[w] = sum_p Sp[w] and the absolute overlap
+  // Ov[w] = (1/P) sum_p ov_[w], and invokes accumulate(Gp, ov_, Sp, ip, r0, rN) so each caller folds
+  // Gp into its own (S_p-weighted) numerator. (r0, rN) is this core's band of the Gsize dimension.
+  // Calls maybe_advance_inner_ensemble() first so the dynamic ensemble is resampled once per step.
+  template<class WlkSet, class TVecD, class TVecOv, class Accumulate>
+  void reduce_inner_cross_dm(const WlkSet& wset,
+                             bool compact,
+                             bool transposed,
+                             int Gsize,
+                             TVecD&& D,
+                             TVecOv&& Ov,
+                             Accumulate&& accumulate);
 };
 
 } // namespace afqmc

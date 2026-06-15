@@ -132,6 +132,20 @@ std::unique_ptr<StochasticInnerStack<MP, MType>> WavefunctionFactory::buildStoch
   if (not prop_pt.get_child_optional("name"))
     prop_pt.put("name", pt.get<std::string>("name") + "_inner_propagator");
 
+  // Phase 3b: when the inner ensemble is dynamic (inner_nsteps > 0), the inner propagator must run in
+  // free-projection mode so it field-samples psi_p = B_T(Y^[p])|phi_T> with bare Gaussian fields (no
+  // force bias, no constraint). Force the exact mode combination AFQMCBasePropagator::interpret_inputs
+  // requires for free projection, so a user inner_propagator block cannot silently select hybrid or
+  // constrained sampling. At inner_nsteps == 0 the propagator is dormant (Phase 1c-3a), so leave the
+  // factory default (hybrid) untouched -- this keeps stochastic_inner_propagator_construction valid.
+  if (pt.get<int>("inner_nsteps", 0) > 0)
+  {
+    prop_pt.put("free_projection", true);
+    prop_pt.put("hybrid", true);
+    prop_pt.put("importance_sampling", false);
+    prop_pt.put("apply_constrain", false);
+  }
+
   // Dedicated device RNG, rank-decorrelated like the driver propagator RNG
   // (inner_seed = 0 selects a time-based seed, matching the driver "seed" convention).
   int inner_seed = pt.get<int>("inner_seed", 777);

@@ -51,6 +51,10 @@ void StochasticWfn<MP, devPsiT>::initialize_inner_walkers(ptree const& walker_pt
                                  initial_guess[1](initial_guess.extension(1), {0, NAEB}));
   else
     inner_ensemble_.wset->resize(inner_nwalkers_, initial_guess[0], initial_guess[0]);
+  // Phase 3b: keep the anchor |phi_T> so maybe_advance_inner_ensemble() can reset the inner walkers to
+  // it before resampling each outer step. WalkerSet::resize only initializes NEW walkers, so it cannot
+  // be reused to reset; we re-assign each walker's Slater matrix from this copy instead.
+  inner_anchor_ = initial_guess;
   inner_ensemble_.initialized = true;
 }
 
@@ -68,6 +72,65 @@ Propagator const& StochasticWfn<MP, devPsiT>::inner_propagator() const
   if (not inner_stack_->has_propagator())
     APP_ABORT("Error in StochasticWfn::inner_propagator: inner propagator not built.");
   return inner_stack_->propagator();
+}
+
+/*
+ * Phase 3b: resample the inner (stochastic-trial) ensemble. When the per-outer-step latch is armed
+ * (begin_inner_step() was called by the outer propagator) and inner_nsteps_ > 0, reset every inner
+ * walker's Slater matrix to the anchor |phi_T> and apply inner_nsteps_ free-projection B_T steps with
+ * fresh Gaussian fields, producing a new walker-independent single-step ensemble
+ *   {psi_p = B_T(Y^[p]) |phi_T>}   (one Slater determinant per sampled field path; arXiv:2505.18519 Eq. 21).
+ * The latch makes this run exactly once per outer step regardless of which reduction is called first.
+ *
+ * Reset-then-resample (not a continuous free walk): the single-step trial is B_T applied to the
+ * ANCHOR with freshly sampled fields, so each outer step starts from |phi_T> again. At inner_nsteps_
+ * == 0 this is a no-op and the ensemble stays the static anchor (Phase 1c-3a). The inner-walker
+ * WEIGHT/OVLP/PHASE are not consumed by the reductions (which weight by the cross-overlap phase S_p,
+ * not the inner-walker weight), so only the Slater matrices need resetting; the inner propagator runs
+ * in free-projection mode (forced in buildStochasticInnerStack), so no bias/constraint is applied.
+ */
+template<bool MP, class devPsiT>
+void StochasticWfn<MP, devPsiT>::maybe_advance_inner_ensemble()
+{
+  if (inner_nsteps_ <= 0)
+  {
+    inner_step_pending_ = false;
+    return;
+  }
+  if (not inner_step_pending_)
+    return;
+  inner_step_pending_ = false;
+
+  if (not inner_ensemble_.initialized || inner_ensemble_.wset == nullptr)
+    APP_ABORT("Error in StochasticWfn::maybe_advance_inner_ensemble: inner walkers not initialized.");
+  if (not inner_stack_->has_propagator())
+    APP_ABORT("Error in StochasticWfn::maybe_advance_inner_ensemble: inner propagator not built.");
+
+  WalkerSet& inner     = *inner_ensemble_.wset;
+  const bool collinear = (inner_stack_->nomsd().getWalkerType() == COLLINEAR);
+
+  // Reset each inner walker's Slater matrix to the anchor. Mirror WalkerSet::resize: only the local-TG
+  // root writes the shared walker buffer, with a barrier so the propagator sees a consistent ensemble.
+  if (TG_.TG_local().root())
+  {
+    for (int ip = 0; ip < inner.size(); ++ip)
+    {
+      *inner[ip].SlaterMatrix(Alpha) = inner_anchor_[0];
+      if (collinear)
+      {
+        int naeb = (*inner[ip].SlaterMatrix(Beta)).size(1);
+        *inner[ip].SlaterMatrix(Beta) = inner_anchor_[1](inner_anchor_.extension(1), {0, naeb});
+      }
+    }
+  }
+  TG_.TG_local().barrier();
+
+  // Apply inner_nsteps_ free-projection B_T steps (Eshift = 0: it only rescales the inner-walker
+  // WEIGHT in free_projection_walker_update, which the reductions never read). dt from inner_timestep_.
+  RealType eshift(0);
+  RealType dt(inner_timestep_);
+  inner_propagator().Propagate(inner_nsteps_, inner, eshift, dt, 1);
+  TG_.TG_local().barrier();
 }
 
 /*
@@ -90,6 +153,12 @@ void StochasticWfn<MP, devPsiT>::Overlap(const WlkSet& wset, TVec&& Ov)
   if (not inner_ensemble_.initialized || inner_ensemble_.wset == nullptr)
     APP_ABORT("Error in StochasticWfn::Overlap: inner walkers not initialized "
               "(call maybe_initialize_stochastic_inner_walkers first).");
+  // Phase 3b: resample the dynamic inner ensemble once per outer step (no-op at inner_nsteps_ == 0).
+  maybe_advance_inner_ensemble();
+  // Overlap stays the ABSOLUTE reduction Ov[w] = (1/P) sum_p <psi_p|phi_w> (Eq. 24's normalization).
+  // The S_p phase weight (Eq. 26) enters only the ratio estimators (Energy/MixedDM, where the per-walker
+  // normalization N(phi) cancels); dropping the magnitude here would break Overlap == NOMSD at the
+  // delegate limit, and the exact N(phi) cancellation is the Phase 3c leapfrog.
   WalkerSet& inner = *inner_ensemble_.wset;
   const int nw     = wset.size();
   const int P      = inner.size();
@@ -145,52 +214,33 @@ void StochasticWfn<MP, devPsiT>::Overlap(WlkSet& wset)
 }
 
 /*
- * Stochastic trial local energy (Phase 2b, static-ensemble limit). For each outer walker phi_w
- * we reduce the inner ensemble {psi_p} (p = 0..P-1) into an effective local energy and overlap
- *   E[w]  = sum_p <psi_p|H|phi_w> / sum_p <psi_p|phi_w>,
- *   Ov[w] = (1/P) sum_p <psi_p|phi_w>,
- * the inner_nsteps = 0 specialization of Eq. 27 of arXiv:2505.18519 (B_T = 1, so the phase
- * factor S(Y) and importance reweighting of Eq. 25-26 are degenerate and reduce to a plain
- * average; those arrive with the inner-propagation leapfrog in Phase 3). The reduction mirrors
- * NOMSD::Energy_shared exactly, with the trial-determinant loop replaced by the inner-walker
- * loop and the CI weight conj(ci[nd]) replaced by 1/P: per inner walker we form the cross mixed
- * density matrix against every outer walker, accumulate (1/P)<psi_p|phi_w> into Ov and
- * (1/P)<psi_p|phi_w> E_{p,w} into E, then divide E by Ov to obtain the local energy. The 1/P
- * cancels in E but is kept so Ov[w] is the same reduction as Phase 2a Overlap -- the same
- * per-pair terms (1/P)<psi_p|phi_w>, hence equal up to floating-point summation order (Phase 2a
- * sums nw*P pairs via FairDivide + all_reduce; here we sum per inner walker). The
- * stochastic_energy_matches_nomsd test asserts this Overlap/Energy agreement within Approx.
+ * Stochastic trial local energy (Phase 2b / Phase 3b). For each outer walker phi_w we reduce the
+ * inner ensemble {psi_p} (p = 0..P-1) into an effective local energy and overlap (Eq. 27 of
+ * arXiv:2505.18519):
+ *   E[w]  = sum_p S_p[w] E_{p,w} / sum_p S_p[w],   E_{p,w} = <psi_p|H|phi_w>/<psi_p|phi_w>,
+ *   Ov[w] = (1/P) sum_p <psi_p|phi_w>,             S_p[w]  = <psi_p|phi_w>/|<psi_p|phi_w>| (Eq. 26).
+ * The per-inner-walker cross-DM loop, the S_p phase weight, the denominator D[w] = sum_p S_p[w], and
+ * the absolute overlap Ov are all handled by the shared helper reduce_inner_cross_dm; here we only
+ * supply the energy numerator via the accumulate callback. At inner_nsteps_ == 0 every psi_p equals
+ * the anchor so the S_p are degenerate and E/Ov collapse to the Phase 3a values (and to NOMSD at the
+ * single-determinant delegate limit); the difference from the old (1/P)<psi_p|phi_w> weighting is
+ * summation-order only at the static limit.
  *
- * The cross mixed DM uses herm = false (the inner walker Slater matrix is [NMO, NEL], as in
- * Phase 2a Overlap, rather than the pre-transposed trial NOMSD passes with herm = true).
+ * Hamiltonian sourcing (dual-Hamiltonian architecture; see StochasticDevelopment.md): H is the *True*
+ * Hamiltonian (outer delegate nomsd_), not inner_nomsd() (which becomes the Variational Ham). The
+ * cross DM is Hamiltonian-independent (computed on nomsd_'s SDetOp), but the energy contraction is.
  *
- * Hamiltonian sourcing (dual-Hamiltonian architecture; see StochasticDevelopment.md): H is the
- * *True* Hamiltonian, which lives in the OUTER delegate nomsd_ -- so the cross DM and energy_from_G
- * run on nomsd_, NOT inner_nomsd(). The inner stack's HamOps becomes the *Variational* Hamiltonian
- * once Phase 3b drives B_T, at which point inner_nomsd().energy_from_G would return the wrong
- * operator. (The bras psi_p are still the inner WALKERS from inner_ensemble_.wset; only the
- * Ham-dependent contraction is scored on nomsd_. The cross DM itself is Hamiltonian-independent.)
- * energy_from_G is called with nd = 0 because in the static-ensemble limit every inner walker
- * equals the trial's anchor determinant (getInitialGuess == OrbMats[0]), whose half-rotated
- * integrals back the nd = 0 energy; Phase 3b must revisit this (per-walker nd) once inner walkers
- * are propagated away from the anchor. At the single-determinant delegate limit both E and Ov
- * reproduce NOMSD exactly.
+ * Half-rotation (Phase 3b): once inner walkers leave the anchor (inner_nsteps_ > 0) the nd = 0
+ * half-rotated integrals no longer match the cross-DM basis, so we form the FULL (NMO x NMO) cross G
+ * (compact = false) and contract it with the un-rotated full Cholesky via energy_from_fullG. At
+ * inner_nsteps_ == 0 we keep the proven compact nd = 0 path (energy_from_G), so the static delegate
+ * limit is byte-for-byte the Phase 2b code (up to the S_p vs 1/P summation noted above).
  */
 template<bool MP, class devPsiT>
 template<class WlkSet, class Mat, class TVec>
 void StochasticWfn<MP, devPsiT>::Energy(const WlkSet& wset, Mat&& E, TVec&& Ov)
 {
   using std::fill_n;
-  if (not inner_ensemble_.initialized || inner_ensemble_.wset == nullptr)
-    APP_ABORT("Error in StochasticWfn::Energy: inner walkers not initialized "
-              "(call maybe_initialize_stochastic_inner_walkers first).");
-  // Cholesky-distributed reduction (NGroupsPerTG > 1) is deferred: a single energy_from_G call
-  // sees only this group's Cholesky vectors, so it would return a partial energy. NOMSD handles
-  // this with a ring reduction (Energy_distributed); Phase 2b targets the shared limit.
-  if (TG_.getNGroupsPerTG() > 1)
-    APP_ABORT("Error in StochasticWfn::Energy: distributed (NGroupsPerTG > 1) stochastic energy "
-              "not yet supported (Phase 2b is shared-only; see StochasticDevelopment.md).");
-
   RUNTIME_CHECK(E.dimensionality == 2, "");
   RUNTIME_CHECK(Ov.dimensionality == 1, "");
   RUNTIME_CHECK(E.size(0) == wset.size(), "");
@@ -198,57 +248,42 @@ void StochasticWfn<MP, devPsiT>::Energy(const WlkSet& wset, Mat&& E, TVec&& Ov)
   RUNTIME_CHECK(E.stride(0) == E.size(1), ""); // contiguous: fill_n / all_reduce span 3*nwalk
   RUNTIME_CHECK(Ov.size(0) == wset.size(), "");
 
-  WalkerSet& inner = *inner_ensemble_.wset;
-  const int nwalk  = wset.size();
-  const int P      = inner.size();
-  RUNTIME_CHECK(P >= 1, "");
-
-  // Score against the True Hamiltonian: use the OUTER delegate nomsd_, not inner_nomsd() (whose
-  // HamOps becomes the Variational Ham at Phase 3b). nomsd_ shares TG_ with this reduction, so its
-  // DensityMatrix / energy_from_G barriers stay consistent. The bras psi_p are the inner WALKERS
-  // (inner_ensemble_.wset, indexed below); only the Ham-dependent contraction lives on nomsd_.
   NOMSD<MP, devPsiT>& ref = nomsd_;
+  const int nwalk       = wset.size();
   const ComplexType zero(0.0);
-  const ComplexType inv_P(1.0 / static_cast<double>(P), 0.0);
-  const bool collinear    = (ref.getWalkerType() == COLLINEAR);
-  const bool transposed_E = ref.transposed_G_for_E();
-  const int Gsize         = ref.dm_size(false); // compact G size; dm_size is friend-accessible
+  const bool full       = (inner_nsteps_ > 0);  // dynamic ensemble -> un-rotated full-G energy
+  const bool compact    = not full;             // static (Phase 3a): compact nd = 0 half-rotation
+  // Full-G energy (energy_from_fullG / full_g::energy_closed) expects G as [nwalk][NMO*NMO], so request
+  // the transposed layout uniformly when dynamic (DensityMatrix is Hamiltonian-independent, so it can
+  // produce either layout regardless of the HamOp's transposed_G_for_E()). Static keeps the compact
+  // nd = 0 layout the HamOp's energy() expects.
+  const bool transposed = full ? true : ref.transposed_G_for_E();
+  const int Gsize       = ref.dm_size(full);    // full size when dynamic, compact when static
+  const bool root       = TG_.TG_local().root();
 
-  // Shared mixed density matrix G with its per-walker overlap ov_ packed contiguously after it
-  // (mirrors NOMSD::Energy_shared); per-core energy components eloc2.
-  int nr = Gsize, nc = nwalk;
-  if (transposed_E)
-    std::swap(nr, nc);
-  StaticSHMVector shmbuff(iextensions<1u>{(Gsize + 1) * nwalk}, ComplexType(0.0),
-                          shm_buffer_manager.get_generator().template get_allocator<ComplexType>());
-  CMatrix_ref G(make_device_ptr(shmbuff.origin()), {nr, nc});
-  CVector_ref ov_(G.origin() + G.num_elements(), iextensions<1u>{nwalk});
-  StaticMatrix eloc2({nwalk, 3}, ComplexType(0.0),
-                     buffer_manager.get_generator().template get_allocator<ComplexType>());
-
-  fill_n(Ov.origin(), nwalk, zero);
+  // E[w][k] accumulates the partial (per-core) numerator sum_p S_p[w] E_{p,w}[k]; the helper fills the
+  // denominator D[w] = sum_p S_p[w] and the absolute overlap Ov[w]. eloc2 is per-ip scratch.
+  StaticMatrix eloc2({nwalk, 3}, zero, buffer_manager.get_generator().template get_allocator<ComplexType>());
+  StaticVector D(iextensions<1u>{nwalk}, buffer_manager.get_generator().template get_allocator<ComplexType>());
   fill_n(E.origin(), 3 * nwalk, zero);
 
-  for (int ip = 0; ip < P; ++ip)
-  {
-    auto smA = inner[ip].SlaterMatrix(Alpha);
-    auto smB = (collinear ? inner[ip].SlaterMatrix(Beta) : inner[ip].SlaterMatrix(Alpha));
-    // G = <psi_p|c^dag c|phi_w>/<psi_p|phi_w>, ov_ = <psi_p|phi_w> (squared for CLOSED, as in NOMSD).
-    ref.DensityMatrix(wset, *smA, *smB, G, ov_, /*herm=*/false, /*compact=*/true, transposed_E);
-    // Ov[w] += (1/P) <psi_p|phi_w>   -- the Phase 2a overlap reduction term.
-    ma::axpy(inv_P, ov_, Ov);
-    // eloc2[w][k] = E_{p,w}[k] = (E1, EXX, EJ) of the cross mixed DM (overwritten each iteration).
-    ref.energy_from_G(eloc2, G, /*nd=*/0, TG_.TG_local().root());
-    // eloc2[w][k] *= (1/P) <psi_p|phi_w>   -- weight the local energy by its overlap.
-    ma::elementwise(ma::TOp_MUL, 0, inv_P, ov_, eloc2);
-    // E[w][k] += eloc2[w][k]   -- accumulate the energy numerator.
-    ma::add(ComplexType(1.0), eloc2, ComplexType(1.0), E, E);
-  }
+  reduce_inner_cross_dm(wset, compact, transposed, Gsize, D, Ov,
+    [&](auto& Gp, auto& /*ov_*/, auto& Sp, int /*ip*/, int /*r0*/, int /*rN*/) {
+      // E_{p,w}[k] = (E1, EXX, EJ) of the cross mixed DM, scored against the True Ham. addH1 only on
+      // root so the all_reduce below does not multiply E0/one-body by the core count.
+      if (full)
+        ref.energy_from_fullG(eloc2, Gp, root);
+      else
+        ref.energy_from_G(eloc2, Gp, /*nd=*/0, root);
+      // E[w][k] += S_p[w] * E_{p,w}[k]
+      ma::elementwise(ma::TOp_MUL, 0, ComplexType(1.0), Sp, eloc2);
+      ma::add(ComplexType(1.0), eloc2, ComplexType(1.0), E, E);
+    });
 
-  // E holds partial (per-core) energy numerators; reduce, then divide by the total overlap Ov.
+  // E holds partial (per-core) numerators; reduce, then divide by the phase-weight denominator D.
   if (TG_.TG_local().size() > 1)
     TG_.TG_local().all_reduce_in_place_n(raw_pointer_cast(E.origin()), 3 * nwalk, std::plus<>());
-  ma::elementwise(ma::TOp_DIV, 0, Ov, E);
+  ma::elementwise(ma::TOp_DIV, 0, D, E);
   TG_.TG_local().barrier();
 }
 
@@ -272,75 +307,142 @@ void StochasticWfn<MP, devPsiT>::Energy(WlkSet& wset)
 }
 
 /*
- * Stochastic mixed density matrix for the force bias (Phase 3a, static-ensemble limit). For each
- * outer walker phi_w we reduce the inner ensemble {psi_p} (p = 0..P-1) into the effective mixed
- * density matrix the force bias contracts against,
- *   G[w] = sum_p <psi_p|c^dag c|phi_w> / sum_p <psi_p|phi_w>,
- * estimator 3 of arXiv:2505.18519 in the inner_nsteps = 0 limit (B_T = 1, so the phase factor S(Y)
- * and importance reweighting of Eq. 25-26 are degenerate and reduce to a plain average; those arrive
- * with inner propagation in Phase 3b/3c). The contraction x_gamma[w] = L_gamma . G[w] (estimator 4)
- * then runs through the unchanged StochasticWfn::vbias delegate.
+ * Phase 3b shared reduction. Both Energy (2b) and MixedDensityMatrix_for_vbias (3a) reduce the inner
+ * ensemble {psi_p} into a per-outer-walker phase-weighted average (Eq. 27 of arXiv:2505.18519): the
+ * per-inner-walker cross-DM loop, the cross overlap ov_ = <psi_p|phi_w>, the phase weight
+ * S_p[w] = ov_[w]/|ov_[w]| (Eq. 26), the denominator D[w] = sum_p S_p[w], and the absolute overlap
+ * Ov[w] = (1/P) sum_p ov_[w] (Eq. 24's normalization) are identical between them; only the numerator
+ * differs. This helper owns all of the shared machinery and calls back accumulate(Gp, ov_, S_p, ip,
+ * r0, rN) so each estimator folds the cross mixed DM Gp into its own S_p-weighted numerator. (r0, rN)
+ * is this core's band of the Gsize dimension (the MixedDM numerator is banded; the Energy numerator
+ * uses the full G and ignores the band). It also drives the dynamic ensemble: maybe_advance_inner_-
+ * ensemble() resamples {psi_p} once per outer step before the loop.
  *
- * This mirrors NOMSD::MixedDensityMatrix_shared's CI-weighted accumulate-then-normalize, with the
- * trial-determinant loop replaced by the inner-walker loop and the CI weight conj(ci[nd]) replaced by
- * 1/P: per inner walker we form the normalized cross mixed DM and its overlap against every outer
- * walker via DensityMatrix(..., herm = false) (reusing the Phase 2b machinery), accumulate the
- * overlap-weighted numerator (1/P)<psi_p|phi_w> G_{p,w} and the denominator (1/P)<psi_p|phi_w>, then
- * divide. The 1/P cancels, so G[w]'s overlap normalization is the same reduction as the Phase 2a/2b Ov.
- * herm = false because the inner-walker Slater matrix is [NMO, NEL] (the Phase 2a/2b convention), not
- * the pre-transposed trial NOMSD passes with herm = true; both produce the same G.
+ * The cross DM and ov_ run on the OUTER delegate nomsd_ (the True Hamiltonian SDetOp); herm = false
+ * because the inner-walker Slater matrix is [NMO, NEL]. D, Ov, and S_p are computed from the shared,
+ * complete ov_, so they are complete on every core (no all-reduce). The S_p loop is a host loop (CPU
+ * path; GPU re-vectorization of the phase weight is a deferred follow-up).
+ */
+template<bool MP, class devPsiT>
+template<class WlkSet, class TVecD, class TVecOv, class Accumulate>
+void StochasticWfn<MP, devPsiT>::reduce_inner_cross_dm(const WlkSet& wset,
+                                                       bool compact,
+                                                       bool transposed,
+                                                       int Gsize,
+                                                       TVecD&& D,
+                                                       TVecOv&& Ov,
+                                                       Accumulate&& accumulate)
+{
+  using std::fill_n;
+  if (not inner_ensemble_.initialized || inner_ensemble_.wset == nullptr)
+    APP_ABORT("Error in StochasticWfn::reduce_inner_cross_dm: inner walkers not initialized "
+              "(call maybe_initialize_stochastic_inner_walkers first).");
+  // Distributed Cholesky (NGroupsPerTG > 1) is deferred (as in Phase 2b/3a): a single energy/vbias
+  // contraction sees only one group's Cholesky vectors. NOMSD handles this with a ring reduction.
+  if (TG_.getNGroupsPerTG() > 1)
+    APP_ABORT("Error in StochasticWfn::reduce_inner_cross_dm: distributed (NGroupsPerTG > 1) stochastic "
+              "reduction not yet supported (shared-only; see StochasticDevelopment.md).");
+
+  // Phase 3b: resample the dynamic inner ensemble once per outer step (no-op at inner_nsteps_ == 0).
+  maybe_advance_inner_ensemble();
+
+  WalkerSet& inner        = *inner_ensemble_.wset;
+  NOMSD<MP, devPsiT>& ref = nomsd_;
+  const int nwalk         = wset.size();
+  const int P             = inner.size();
+  RUNTIME_CHECK(P >= 1, "");
+  const bool collinear = (ref.getWalkerType() == COLLINEAR);
+  const ComplexType zero(0.0);
+  const ComplexType inv_P(1.0 / static_cast<double>(P), 0.0);
+
+  int nr = Gsize, nc = nwalk;
+  if (transposed)
+    std::swap(nr, nc);
+
+  // Shared cross mixed DM Gp with its per-walker overlap ov_ packed contiguously (mirrors
+  // NOMSD::Energy_shared). Gp/ov_ must be shared: DensityMatrix fills them collectively (round-robin
+  // over walkers across the local TG).
+  StaticSHMVector shmbuff(iextensions<1u>{(Gsize + 1) * nwalk}, zero,
+                          shm_buffer_manager.get_generator().template get_allocator<ComplexType>());
+  CMatrix_ref Gp(make_device_ptr(shmbuff.origin()), {nr, nc});
+  CVector_ref ov_(Gp.origin() + Gp.num_elements(), iextensions<1u>{nwalk});
+  // Per-pair phase weight S_p[w] (Eq. 26); per-core local but complete on every core.
+  StaticVector Sp(iextensions<1u>{nwalk}, buffer_manager.get_generator().template get_allocator<ComplexType>());
+
+  fill_n(D.origin(), nwalk, zero);
+  fill_n(Ov.origin(), nwalk, zero);
+
+  // Band of the Gsize dimension owned by this core (for the callback's banded numerator writes), as in
+  // NOMSD::MixedDensityMatrix_shared -- each band written by one core, no mutex, no double counting.
+  int r0, rN;
+  std::tie(r0, rN) = FairDivideBoundary(TG_.getLocalTGRank(), Gsize, TG_.getNCoresPerTG());
+
+  for (int ip = 0; ip < P; ++ip)
+  {
+    auto smA = inner[ip].SlaterMatrix(Alpha);
+    auto smB = (collinear ? inner[ip].SlaterMatrix(Beta) : inner[ip].SlaterMatrix(Alpha));
+    // Gp = <psi_p|c^dag c|phi_w>/<psi_p|phi_w> (normalized), ov_ = <psi_p|phi_w> (full overlap; squared
+    // for CLOSED, alpha*beta for COLLINEAR). Fills the whole shared Gp/ov_.
+    ref.DensityMatrix(wset, *smA, *smB, Gp, ov_, /*herm=*/false, compact, transposed);
+    // S_p[w] = ov_[w]/|ov_[w]| (Eq. 26); D[w] += S_p[w]; Ov[w] += (1/P) ov_[w] (absolute, Eq. 24). The
+    // shared ov_ is complete on every core, so D/Ov/S_p are complete on every core (no all-reduce).
+    // S_p is a unit phase for ANY nonzero overlap; only an exactly-orthogonal pair (|ov_| == 0,
+    // measure-zero) contributes nothing. NOTE: the ratio estimators divide by D[w] = sum_p S_p[w]; a
+    // near-zero D (random phases failing to add up) is the inherent high-variance pathology of the
+    // walker-INDEPENDENT Phase 3b ensemble -- the Phase 3c importance sampling (conditioning {psi_p} on
+    // phi_w) is what makes D well-behaved. Same family as NOMSD dividing by the trial overlap.
+    for (int w = 0; w < nwalk; ++w)
+    {
+      ComplexType o = ov_[w];
+      double mag    = std::abs(o);
+      ComplexType s = (mag > 0.0) ? (o / ComplexType(mag, 0.0)) : zero;
+      Sp[w]         = s;
+      D[w]          = D[w] + s;
+      Ov[w]         = Ov[w] + inv_P * o;
+    }
+    // Fold G_{p,w} into the caller's S_p-weighted numerator.
+    accumulate(Gp, ov_, Sp, ip, r0, rN);
+    // All cores finish reading/modifying the shared Gp before the next DensityMatrix overwrites it.
+    TG_.TG_local().barrier();
+  }
+}
+
+/*
+ * Stochastic mixed density matrix for the force bias (Phase 3a / Phase 3b). For each outer walker
+ * phi_w we reduce the inner ensemble {psi_p} into the effective mixed DM the force bias contracts
+ * against (estimator 3 / Eq. 27 of arXiv:2505.18519):
+ *   G[w] = sum_p S_p[w] G_{p,w} / sum_p S_p[w],   G_{p,w} = <psi_p|c^dag c|phi_w>/<psi_p|phi_w>.
+ * The per-inner-walker cross-DM loop, S_p phase weights (Eq. 26), and denominator D[w] = sum_p S_p[w]
+ * are handled by reduce_inner_cross_dm; here we supply the S_p-weighted numerator via the callback and
+ * normalize. The contraction x_gamma[w] = L_gamma . G[w] (estimator 4) runs through StochasticWfn::vbias.
+ * At inner_nsteps_ == 0 the S_p degenerate and G collapses to the Phase 3a value (NOMSD at the
+ * single-determinant delegate limit).
  *
- * The output layout (compact / transposed) is the vbias layout of the OUTER delegate nomsd_, read from
- * nomsd_.compact_G_for_vbias / nomsd_.transposed_G_for_vbias_ (friend access), so the reduced G is
- * exactly what nomsd_.vbias expects. Hamiltonian sourcing (dual-Hamiltonian architecture; see
- * StochasticDevelopment.md): the cross DM is Hamiltonian-independent but is run on the OUTER nomsd_
- * (True Ham) so Overlap (2a) / Energy (2b) / vbias (3a) share one SDetOp; the inner stack's HamOps
- * becomes the Variational Ham at Phase 3b, when inner_nomsd() would be the wrong operator. The nd = 0
- * static-anchor assumption is implicit: at inner_nsteps = 0 every inner walker equals the trial anchor
- * (getInitialGuess == OrbMats[0]), so the compact DM's bra basis matches nomsd_'s half-rotated Cholesky
- * (vbias has no per-determinant nd). Phase 3b must revisit this once inner walkers leave the anchor.
+ * Layout / half-rotation: at inner_nsteps_ == 0 the OUTER nomsd_ compact/half-rotated vbias layout
+ * (the cross DM's nd = 0 basis matches the anchor). Once inner walkers leave the anchor
+ * (inner_nsteps_ > 0) that half-rotation is invalid, so we produce the FULL un-rotated layout
+ * [NMO*NMO][nwalk] (compact = false, transposed = false) that vbias_fullG contracts with the full
+ * Cholesky -- matching the size_of_G_for_vbias()/transposed_G_for_vbias() overrides the propagator
+ * uses to size this G. The cross DM itself is Hamiltonian-independent and runs on the True-Ham nomsd_.
  *
- * The weighted numerator is accumulated in a full-precision shared scratch (Gnum) and cast once into
- * the caller's (possibly single-precision) vbias G via copy_n_cast, so the reduction never mixes
+ * The S_p-weighted numerator accumulates in a full-precision shared scratch (Gnum) and is cast once
+ * into the caller's (possibly single-precision) vbias G via copy_n_cast, so the reduction never mixes
  * precisions in ma::add / ma::elementwise; this mirrors the propagator's own SP handling.
- *
- * The inner-walker loop below (guards, herm = false cross DM on nomsd_, Ov += (1/P)⟨ψ_p|φ_w⟩) is
- * intentionally parallel to Energy (Phase 2b). It is deliberately NOT yet factored into a shared
- * helper: Phase 3b changes the per-pair weight (1/P → the S_p phase factor) in both methods at once,
- * so the shared reduction is extracted then, when its final shape (S_p, propagated ψ_p, per-walker nd)
- * is fixed and can be rebuilt/tested. See the Phase 3b "Refactor (do here)" row in StochasticDevelopment.md.
  */
 template<bool MP, class devPsiT>
 template<class WlkSet, class MatG>
 void StochasticWfn<MP, devPsiT>::MixedDensityMatrix_for_vbias(const WlkSet& wset, MatG&& G)
 {
   using std::fill_n;
-  if (not inner_ensemble_.initialized || inner_ensemble_.wset == nullptr)
-    APP_ABORT("Error in StochasticWfn::MixedDensityMatrix_for_vbias: inner walkers not initialized "
-              "(call maybe_initialize_stochastic_inner_walkers first).");
-  // Distributed Cholesky (NGroupsPerTG > 1) is deferred, as in Phase 2b Energy: the distributed
-  // propagators pass cross-group G buffers this shared-limit reduction does not handle.
-  if (TG_.getNGroupsPerTG() > 1)
-    APP_ABORT("Error in StochasticWfn::MixedDensityMatrix_for_vbias: distributed (NGroupsPerTG > 1) "
-              "stochastic force bias not yet supported (Phase 3a is shared-only; see StochasticDevelopment.md).");
-
-  WalkerSet& inner = *inner_ensemble_.wset;
-  const int nwalk  = wset.size();
-  const int P      = inner.size();
-  RUNTIME_CHECK(P >= 1, "");
-
-  // Layout/scoring against the True Hamiltonian: use the OUTER delegate nomsd_, not inner_nomsd()
-  // (whose HamOps becomes the Variational Ham at Phase 3b). The cross DM is Ham-independent, but the
-  // vbias layout flags and the downstream vbias contraction are the outer delegate's.
   NOMSD<MP, devPsiT>& ref = nomsd_;
-  const bool compact    = ref.compact_G_for_vbias;
-  const bool transposed = ref.transposed_G_for_vbias_;
-  const int Gsize       = ref.dm_size(not compact); // == size_of_G_for_vbias()
-  const bool collinear  = (ref.getWalkerType() == COLLINEAR);
+  const int nwalk       = wset.size();
   const ComplexType zero(0.0);
-  const ComplexType inv_P(1.0 / static_cast<double>(P), 0.0);
+  const bool full       = (inner_nsteps_ > 0);
+  const bool compact    = full ? false : ref.compact_G_for_vbias;
+  const bool transposed = full ? false : ref.transposed_G_for_vbias_;
+  const int Gsize       = full ? ref.dm_size(true) : ref.dm_size(not ref.compact_G_for_vbias);
 
-  // Output G must be in the vbias layout NOMSD::vbias expects (same checks as DensityMatrix_shared).
+  // Output G must be in the advertised vbias layout (same checks as DensityMatrix_shared / vbias).
   RUNTIME_CHECK(G.stride(1) == 1, "");
   if (transposed)
     RUNTIME_CHECK(G.size(0) == nwalk && G.size(1) == Gsize, "");
@@ -352,71 +454,54 @@ void StochasticWfn<MP, devPsiT>::MixedDensityMatrix_for_vbias(const WlkSet& wset
   if (transposed)
     std::swap(nr, nc);
 
-  // Shared scratch: full-precision numerator Gnum (same layout as G), the per-inner-walker normalized
-  // cross mixed DM Gp (same layout), and Gp's per-walker overlap ov_, packed contiguously (mirrors
-  // NOMSD::Energy_shared / the Phase 2b shmbuff). Gp/ov_ must be shared because DensityMatrix fills
-  // them collectively (round-robin over walkers across the local TG).
-  StaticSHMVector shmbuff(iextensions<1u>{(2 * Gsize + 1) * nwalk}, zero,
-                          shm_buffer_manager.get_generator().template get_allocator<ComplexType>());
-  CMatrix_ref Gnum(make_device_ptr(shmbuff.origin()), {nr, nc});
-  CMatrix_ref Gp(Gnum.origin() + Gnum.num_elements(), {nr, nc});
-  CVector_ref ov_(Gp.origin() + Gp.num_elements(), iextensions<1u>{nwalk});
-  // Total overlap denominator Ov[w] = sum_p (1/P)<psi_p|phi_w>; per-core local but complete on every
-  // core (accumulated from the shared, complete ov_), as in Energy.
+  // Full-precision numerator Gnum[w] = sum_p S_p[w] G_{p,w} (same layout as G). The helper fills the
+  // denominator D[w] = sum_p S_p[w]; Ov is filled but unused here (vbias normalizes by D, not Ov).
+  StaticSHMVector gnumbuff(iextensions<1u>{Gsize * nwalk}, zero,
+                           shm_buffer_manager.get_generator().template get_allocator<ComplexType>());
+  CMatrix_ref Gnum(make_device_ptr(gnumbuff.origin()), {nr, nc});
+  StaticVector D(iextensions<1u>{nwalk}, buffer_manager.get_generator().template get_allocator<ComplexType>());
   StaticVector Ov(iextensions<1u>{nwalk}, buffer_manager.get_generator().template get_allocator<ComplexType>());
 
-  fill_n(Ov.origin(), nwalk, zero);
   fill_n(Gnum.origin(), Gnum.num_elements(), zero);
   TG_.TG_local().barrier();
 
-  // Partition the Gsize dimension of the shared numerator across the local TG (all walkers stay in
-  // each band), exactly as NOMSD::MixedDensityMatrix_shared partitions its normalization, so each band
-  // of Gnum is written by a single core -- no mutex, no double counting.
+  reduce_inner_cross_dm(wset, compact, transposed, Gsize, D, Ov,
+    [&](auto& Gp, auto& /*ov_*/, auto& Sp, int /*ip*/, int r0, int rN) {
+      // Gnum[band][w] += S_p[w] * G_{p,w}[band][w] (this core's Gsize-band only). Weight Gp in place by
+      // S_p along the walker axis, then add into Gnum (both full precision: no mixed add).
+      if (rN > r0)
+      {
+        if (transposed)
+        {
+          auto Gpband   = Gp(Gp.extension(0), {r0, rN});
+          auto Gnumband = Gnum(Gnum.extension(0), {r0, rN});
+          ma::elementwise(ma::TOp_MUL, 0, ComplexType(1.0), Sp, Gpband);
+          ma::add(ComplexType(1.0), Gpband, ComplexType(1.0), Gnumband, Gnumband);
+        }
+        else
+        {
+          auto Gpband   = Gp.sliced(r0, rN);
+          auto Gnumband = Gnum.sliced(r0, rN);
+          ma::elementwise(ma::TOp_MUL, 1, ComplexType(1.0), Sp, Gpband);
+          ma::add(ComplexType(1.0), Gpband, ComplexType(1.0), Gnumband, Gnumband);
+        }
+      }
+    });
+
+  // Normalize the numerator by the phase-weight denominator: G[w] = Gnum[w] / D[w] (this core's band).
   int r0, rN;
   std::tie(r0, rN) = FairDivideBoundary(TG_.getLocalTGRank(), Gsize, TG_.getNCoresPerTG());
-
-  for (int ip = 0; ip < P; ++ip)
-  {
-    auto smA = inner[ip].SlaterMatrix(Alpha);
-    auto smB = (collinear ? inner[ip].SlaterMatrix(Beta) : inner[ip].SlaterMatrix(Alpha));
-    // Gp = <psi_p|c^dag c|phi_w>/<psi_p|phi_w> (normalized), ov_ = <psi_p|phi_w> (full overlap;
-    // squared for CLOSED, alpha*beta for COLLINEAR, as in NOMSD). Fills the whole shared Gp/ov_.
-    ref.DensityMatrix(wset, *smA, *smB, Gp, ov_, /*herm=*/false, compact, transposed);
-    // Ov[w] += (1/P)<psi_p|phi_w>   -- the Phase 2a/2b overlap reduction term (complete on every core).
-    ma::axpy(inv_P, ov_, Ov);
-    // Numerator: Gnum[w] += (1/P)<psi_p|phi_w> Gp[w], on this core's Gsize-band only. Weight Gp in
-    // place by inv_P*ov_ along the walker axis, then add into Gnum (both full precision: no mixed add).
-    if (rN > r0)
-    {
-      if (transposed)
-      {
-        auto Gpband   = Gp(Gp.extension(0), {r0, rN});
-        auto Gnumband = Gnum(Gnum.extension(0), {r0, rN});
-        ma::elementwise(ma::TOp_MUL, 0, inv_P, ov_, Gpband);
-        ma::add(ComplexType(1.0), Gpband, ComplexType(1.0), Gnumband, Gnumband);
-      }
-      else
-      {
-        auto Gpband   = Gp.sliced(r0, rN);
-        auto Gnumband = Gnum.sliced(r0, rN);
-        ma::elementwise(ma::TOp_MUL, 1, inv_P, ov_, Gpband);
-        ma::add(ComplexType(1.0), Gpband, ComplexType(1.0), Gnumband, Gnumband);
-      }
-    }
-  }
-
-  // Normalize the numerator by the total overlap: G[w] = Gnum[w] / Ov[w] (this core's band only).
   if (rN > r0)
   {
     if (transposed)
     {
       auto Gnumband = Gnum(Gnum.extension(0), {r0, rN});
-      ma::elementwise(ma::TOp_DIV, 0, Ov, Gnumband);
+      ma::elementwise(ma::TOp_DIV, 0, D, Gnumband);
     }
     else
     {
       auto Gnumband = Gnum.sliced(r0, rN);
-      ma::elementwise(ma::TOp_DIV, 1, Ov, Gnumband);
+      ma::elementwise(ma::TOp_DIV, 1, D, Gnumband);
     }
   }
   TG_.TG_local().barrier();

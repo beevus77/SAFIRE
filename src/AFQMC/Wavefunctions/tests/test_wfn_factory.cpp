@@ -627,11 +627,11 @@ void stochastic_wfn_matches_nomsd(boost::mpi3::communicator& world)
   ctx.TG.TG_local().barrier();
 
   REQUIRE(wset_stoch.size() == ov_ref.size());
-  // Overlap (Phase 2a) and Energy (Phase 2b) reduce a single-determinant inner ensemble, so they
-  // equal NOMSD only at the single-determinant delegate limit; a multi-determinant trial diverges
-  // by design (see StochasticDevelopment.md and the dedicated stochastic_overlap_matches_nomsd /
-  // stochastic_energy_matches_nomsd tests). Gate on ndet == 1. The MixedDensityMatrix_for_vbias /
-  // vbias comparisons below still delegate to nomsd_ (Phase 3) and stay unconditional.
+  // Overlap (Phase 2a), Energy (Phase 2b), and MixedDensityMatrix_for_vbias / vbias (Phase 3a) all
+  // reduce a single-determinant inner ensemble, so they equal NOMSD only at the single-determinant
+  // delegate limit; a multi-determinant trial diverges by design (see StochasticDevelopment.md and the
+  // dedicated stochastic_overlap_matches_nomsd / stochastic_energy_matches_nomsd /
+  // stochastic_vbias_matches_nomsd tests). All NOMSD-equality assertions are gated on ndet == 1.
   if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
   {
     for (int n = 0; n < static_cast<int>(ov_ref.size()); ++n)
@@ -649,26 +649,30 @@ void stochastic_wfn_matches_nomsd(boost::mpi3::communicator& world)
     }
   }
 
+  // Compute the stochastic mixed DM + force bias unconditionally (exercises the Phase 3a override and
+  // its layout/runtime handling on any trial), but compare to NOMSD only at the delegate limit.
   CMatrix G_stoch({Gdim1, Gdim2}, ctx.alloc_);
   wfn_stoch.MixedDensityMatrix_for_vbias(wset_stoch, G_stoch);
-  for (int i = 0; i < G_stoch.size(0); ++i)
-    for (int j = 0; j < G_stoch.size(1); ++j)
-    {
-      REQUIRE(real(ComplexType(G_stoch[i][j])) == Approx(real(ComplexType(G_nomsd[i][j]))));
-      REQUIRE(imag(ComplexType(G_stoch[i][j])) == Approx(imag(ComplexType(G_nomsd[i][j]))));
-    }
-
   ctx.maybe_init_model_ham(wfn_stoch, dt);
   CMatrix X_stoch({nCV, ctx.nwalk}, ctx.alloc_);
   wfn_stoch.vbias(G_stoch, X_stoch, dt);
   ctx.TG.TG_local().barrier();
 
-  for (int i = 0; i < X_stoch.size(0); ++i)
-    for (int j = 0; j < X_stoch.size(1); ++j)
-    {
-      REQUIRE(real(ComplexType(X_stoch[i][j])) == Approx(real(ComplexType(X_nomsd[i][j]))));
-      REQUIRE(imag(ComplexType(X_stoch[i][j])) == Approx(imag(ComplexType(X_nomsd[i][j]))));
-    }
+  if (wfn_nomsd.number_of_references_for_back_propagation() == 1)
+  {
+    for (int i = 0; i < G_stoch.size(0); ++i)
+      for (int j = 0; j < G_stoch.size(1); ++j)
+      {
+        REQUIRE(real(ComplexType(G_stoch[i][j])) == Approx(real(ComplexType(G_nomsd[i][j]))));
+        REQUIRE(imag(ComplexType(G_stoch[i][j])) == Approx(imag(ComplexType(G_nomsd[i][j]))));
+      }
+    for (int i = 0; i < X_stoch.size(0); ++i)
+      for (int j = 0; j < X_stoch.size(1); ++j)
+      {
+        REQUIRE(real(ComplexType(X_stoch[i][j])) == Approx(real(ComplexType(X_nomsd[i][j]))));
+        REQUIRE(imag(ComplexType(X_stoch[i][j])) == Approx(imag(ComplexType(X_nomsd[i][j]))));
+      }
+  }
 
   ctx.TG.Global().barrier();
 }

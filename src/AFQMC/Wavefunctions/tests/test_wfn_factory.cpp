@@ -43,6 +43,7 @@
 #include "AFQMC/Wavefunctions/WavefunctionFactory.h"
 #include "AFQMC/Walkers/WalkerSet.hpp"
 #include "AFQMC/Propagators/Propagator.hpp"
+#include "AFQMC/Propagators/PropagatorFactory.h"
 
 #include "SparseMatrix/csr_matrix_construct.hpp"
 #include "Numerics/ma_blas.hpp"
@@ -1323,6 +1324,143 @@ void stochastic_full_g_matches_compact(boost::mpi3::communicator& world)
   ctx.TG.Global().barrier();
 }
 
+// Phase 3b: smoke test of the dynamic-ensemble drive. With inner_nsteps > 0 and begin_inner_step()
+// called before each Energy, the inner ensemble is reset to the anchor and advanced inner_nsteps
+// free-projection B_T steps, then scored with the un-rotated full-G energy on the moved walkers. This
+// exercises the full propagation + full-G path (maybe_advance_inner_ensemble -> inner Propagate ->
+// energy_fullG) end to end; we assert the resulting energies/overlaps are finite (a stochastic value,
+// not a fixed number). CLOSED (RHF) trials only this phase.
+template<bool MP, class Allocator>
+void stochastic_dynamic_ensemble_smoke(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_HAMIL) || not file_exists(UTEST_WFN))
+    APP_ABORT(" Hamiltonian or wavefunction file not found. Run unit test with --hamil /path/to/hamil.h5 and --wfn /path/to/wfn.h5.");
+  if (afqmc::getWavefunctionType(UTEST_WFN) != "NOMSD")
+    return;
+
+  WfnTestContext<MP, Allocator> ctx(world);
+  if (ctx.type != CLOSED)
+    return; // Phase 3b un-rotated full-G kernels support CLOSED (RHF) trials only.
+
+  ptree pt = ctx.make_wfn_pt("wfn_stoch_dyn", UTEST_WFN, true, 4);
+  pt.put("inner_nsteps", 1);
+  ptree inner_prop;
+  inner_prop.put("timestep", 0.01);
+  pt.put_child("inner_propagator", inner_prop);
+  Wavefunction& wfn = ctx.register_wavefunction("wfn_stoch_dyn", pt);
+
+  WalkerSet wset = ctx.make_walker_set();
+  ctx.init_walkers(wset, "wfn_stoch_dyn");
+
+  using CMatrix  = Matrix_<Allocator>;
+  const double dt(0.01);
+  const auto nCV = wfn.local_number_of_cholesky_vectors();
+
+  // Each "step" mimics one outer AFQMCBasePropagator::step: arm the latch, then exercise the hot-path
+  // stochastic overrides in order. begin_inner_step() + the first reduction (MixedDensityMatrix_for_vbias)
+  // resamples the inner ensemble once; vbias/Energy/Overlap then all score the SAME moved ensemble. This
+  // exercises all four overrides (incl. vbias_fullG / energy_fullG on PROPAGATED walkers, not just the
+  // anchor) end to end; we assert finiteness (the values are stochastic, not fixed). A full
+  // AFQMCBasePropagator::step() driving an outer propagator is the priority compute-node follow-up.
+  for (int step = 0; step < 3; ++step)
+  {
+    wfn.begin_inner_step();
+    // size the vbias G in the layout the dynamic path advertises (full [NMO*NMO][nwalk]).
+    auto size_of_G = wfn.size_of_G_for_vbias();
+    int Gdim1      = (wfn.transposed_G_for_vbias() ? ctx.nwalk : size_of_G);
+    int Gdim2      = (wfn.transposed_G_for_vbias() ? size_of_G : ctx.nwalk);
+    CMatrix G({Gdim1, Gdim2}, ctx.alloc_);
+    wfn.MixedDensityMatrix_for_vbias(wset, G); // first reduction -> resamples; full cross G
+    CMatrix X({nCV, ctx.nwalk}, ctx.alloc_);
+    wfn.vbias(G, X, dt);                        // vbias_fullG on the moved ensemble
+    wfn.Energy(wset);                           // energy_fullG on the same ensemble (latch consumed)
+    wfn.Overlap(wset);
+    ctx.TG.TG_local().barrier();
+    for (auto it = wset.begin(); it != wset.end(); ++it)
+    {
+      REQUIRE(std::isfinite(real(ComplexType(it->energy()))));
+      REQUIRE(std::isfinite(imag(ComplexType(it->energy()))));
+      REQUIRE(std::isfinite(real(ComplexType(*it->overlap()))));
+    }
+    for (int i = 0; i < X.size(0); ++i)
+      for (int j = 0; j < X.size(1); ++j)
+        REQUIRE(std::isfinite(real(ComplexType(X[i][j]))));
+  }
+
+  ctx.TG.Global().barrier();
+}
+
+// Phase 3b: end-to-end propagator integration. Build a real OUTER AFQMCBasePropagator (default hybrid
+// mode) bound to the dynamic stochastic trial (inner_nsteps = 1) and run Propagate() steps. Unlike the
+// smoke test (which calls the overrides directly), this drives the full hot path THROUGH the propagator:
+// begin_inner_step (arms the resample latch) -> MixedDensityMatrix_for_vbias (resample + full cross G,
+// sized by the propagator from size_of_G_for_vbias()/transposed_G_for_vbias()) -> vbias (vbias_fullG) ->
+// vHS -> apply_propagators -> Overlap (hybrid weight update). This validates that the stochastic
+// overrides + the full-G layout plug into a real propagation step (the long-standing integration
+// follow-up). Asserts the walkers stay finite. CLOSED (RHF) trials only this phase.
+template<bool MP, class Allocator>
+void stochastic_propagator_step(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_HAMIL) || not file_exists(UTEST_WFN))
+    APP_ABORT(" Hamiltonian or wavefunction file not found. Run unit test with --hamil /path/to/hamil.h5 and --wfn /path/to/wfn.h5.");
+  if (afqmc::getWavefunctionType(UTEST_WFN) != "NOMSD")
+    return;
+
+  WfnTestContext<MP, Allocator> ctx(world);
+  if (ctx.type != CLOSED)
+    return; // Phase 3b un-rotated full-G kernels support CLOSED (RHF) trials only.
+
+  ptree pt = ctx.make_wfn_pt("wfn_stoch_prop", UTEST_WFN, true, 4);
+  pt.put("inner_nsteps", 1);
+  ptree inner_prop;
+  inner_prop.put("timestep", 0.01);
+  pt.put_child("inner_propagator", inner_prop);
+  Wavefunction& wfn = ctx.register_wavefunction("wfn_stoch_prop", pt);
+
+  WalkerSet wset = ctx.make_walker_set();
+  ctx.init_walkers(wset, "wfn_stoch_prop");
+
+  // Prime walker overlaps/energies (anchor ensemble; begin_inner_step not yet called) and pick an
+  // energy shift so the hybrid weights stay well-scaled over the test steps.
+  wfn.Overlap(wset);
+  wfn.Energy(wset);
+  ctx.TG.TG_local().barrier();
+  ComplexType eav(0.0), ow(0.0);
+  for (auto it = wset.begin(); it != wset.end(); ++it)
+  {
+    eav += ComplexType(*it->weight()) * ComplexType(it->energy());
+    ow += ComplexType(*it->weight());
+  }
+  RealType Eshift = (std::abs(ow) > 1e-12) ? real(eav / ow) : RealType(0);
+
+  // Build the OUTER propagator (default hybrid) bound to the stochastic trial.
+  ptree prop_pt;
+  prop_pt.put("name", "prop_stoch");
+  prop_pt.put("system", "info0");
+  PropagatorFactory PropgFac(ctx.InfoMap, MP);
+  PropgFac.push("prop_stoch", prop_pt);
+  auto rng_dev     = utils::make_device_rng(13);
+  Propagator& prop = PropgFac.getPropagator(ctx.TG, "prop_stoch", wfn, &rng_dev);
+
+  RealType dt = 0.01;
+  for (int step = 0; step < 3; ++step)
+  {
+    prop.Propagate(1, wset, Eshift, dt, 1); // one full hot-path step; inner ensemble resampled once
+    prop.Orthogonalize(wset);
+    wfn.Energy(wset);
+    ctx.TG.TG_local().barrier();
+    for (auto it = wset.begin(); it != wset.end(); ++it)
+    {
+      REQUIRE(std::isfinite(real(ComplexType(*it->weight()))));
+      REQUIRE(std::isfinite(real(ComplexType(it->energy()))));
+      REQUIRE(std::isfinite(imag(ComplexType(it->energy()))));
+      REQUIRE(std::isfinite(real(ComplexType(*it->overlap()))));
+    }
+  }
+
+  ctx.TG.Global().barrier();
+}
+
 template<bool MP, class Allocator>
 void wfn_fac_distributed(boost::mpi3::communicator& world, int ngroups)
 {
@@ -2093,6 +2231,44 @@ TEST_CASE("stochastic_full_g_matches_compact", "[wavefunction_factory][stochasti
 
   stochastic_full_g_matches_compact<false, Alloc>(world);
   stochastic_full_g_matches_compact<true, Alloc>(world);
+  release_memory_managers();
+}
+
+TEST_CASE("stochastic_dynamic_ensemble_smoke", "[wavefunction_factory][stochastic_wfn]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto node  = world.split_shared(world.rank());
+  setup_loggers(world.root(), 2, 2);
+
+#if defined(ENABLE_DEVICE)
+  arch::INIT(node);
+  using Alloc = device::device_allocator<ComplexType>;
+#else
+  using Alloc = shared_allocator<ComplexType>;
+#endif
+  setup_memory_managers(node, 10uL * 1024uL * 1024uL);
+
+  stochastic_dynamic_ensemble_smoke<false, Alloc>(world);
+  stochastic_dynamic_ensemble_smoke<true, Alloc>(world);
+  release_memory_managers();
+}
+
+TEST_CASE("stochastic_propagator_step", "[wavefunction_factory][stochastic_wfn]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto node  = world.split_shared(world.rank());
+  setup_loggers(world.root(), 2, 2);
+
+#if defined(ENABLE_DEVICE)
+  arch::INIT(node);
+  using Alloc = device::device_allocator<ComplexType>;
+#else
+  using Alloc = shared_allocator<ComplexType>;
+#endif
+  setup_memory_managers(node, 10uL * 1024uL * 1024uL);
+
+  stochastic_propagator_step<false, Alloc>(world);
+  stochastic_propagator_step<true, Alloc>(world);
   release_memory_managers();
 }
 

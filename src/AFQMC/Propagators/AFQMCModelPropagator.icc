@@ -36,6 +36,9 @@ template<bool SP>
 template<class WlkSet>
 void AFQMCModelPropagator<SP>::step_denseP2(int nsteps_, WlkSet& wset, RealType Eshift, RealType dt)
 {
+  // Phase 3b: arm the stochastic-trial inner-ensemble resample latch (no-op unless wfn is a
+  // StochasticWfn with inner_nsteps > 0). See AFQMCBasePropagator::step.
+  wfn.begin_inner_step();
   AFQMCTimer.start(setup_timer);
   auto walker_type = wset.getWalkerType();
   int nsteps       = nsteps_;
@@ -231,8 +234,11 @@ template<bool SP>
 template<class WlkSet>
 void AFQMCModelPropagator<SP>::step_sparseP2(int nsteps_, WlkSet& wset, RealType Eshift, RealType dt)
 {
-  if (nsteps_ != 1)  
-    APP_ABORT(" Error: fix_bias is not yet allowed in Model Hamiltonians with denseP2=false. "); 
+  // Phase 3b: arm the stochastic-trial inner-ensemble resample latch (no-op unless wfn is a
+  // StochasticWfn with inner_nsteps > 0). See AFQMCBasePropagator::step.
+  wfn.begin_inner_step();
+  if (nsteps_ != 1)
+    APP_ABORT(" Error: fix_bias is not yet allowed in Model Hamiltonians with denseP2=false. ");
   AFQMCTimer.start(setup_timer);
   auto walker_type = wset.getWalkerType();
   int nsteps       = nsteps_;

@@ -288,6 +288,49 @@ public:
     boost::apply_visitor([&](auto&& a) { a.energy(std::forward<Args>(args)...); }, *this);
   }
 
+  // Phase 3b (StochasticWfn): un-rotated full-G energy / force bias. Only Real3IndexFactorization (the
+  // CPU Cholesky Hamiltonian) implements these; dispatch via boost::get like vHS_sparse/update_potentials
+  // rather than apply_visitor (which would require every variant member to provide the method). Phase 3b
+  // is CPU-only, so the device-only variants throw.
+  template<class... Args>
+  void energy_fullG(Args&&... args)
+  {
+#if !defined(ENABLE_DEVICE)
+    using R3T = Real3IndexFactorization<MP, true>;
+    using R3F = Real3IndexFactorization<MP, false>;
+    if (R3T* p = boost::get<R3T>(this)) { p->energy_fullG(std::forward<Args>(args)...); return; }
+    if (R3F* p = boost::get<R3F>(this)) { p->energy_fullG(std::forward<Args>(args)...); return; }
+#endif
+    // SparseTensor specializations are present in the variant for both CPU and device builds.
+    using STccc = SparseTensor<MP, ComplexType, ComplexType, ComplexType>;
+    using STrrr = SparseTensor<MP, RealType, RealType, RealType>;
+    using STrcc = SparseTensor<MP, RealType, ComplexType, ComplexType>;
+    if (STccc* p = boost::get<STccc>(this)) { p->energy_fullG(std::forward<Args>(args)...); return; }
+    if (STrrr* p = boost::get<STrrr>(this)) { p->energy_fullG(std::forward<Args>(args)...); return; }
+    if (STrcc* p = boost::get<STrcc>(this)) { p->energy_fullG(std::forward<Args>(args)...); return; }
+    throw std::runtime_error("energy_fullG (Phase 3b un-rotated full-G energy) is only implemented for the "
+                             "Cholesky HamiltonianOperations (Real3IndexFactorization / SparseTensor).");
+  }
+
+  template<class... Args>
+  void vbias_fullG(Args&&... args)
+  {
+#if !defined(ENABLE_DEVICE)
+    using R3T = Real3IndexFactorization<MP, true>;
+    using R3F = Real3IndexFactorization<MP, false>;
+    if (R3T* p = boost::get<R3T>(this)) { p->vbias_fullG(std::forward<Args>(args)...); return; }
+    if (R3F* p = boost::get<R3F>(this)) { p->vbias_fullG(std::forward<Args>(args)...); return; }
+#endif
+    using STccc = SparseTensor<MP, ComplexType, ComplexType, ComplexType>;
+    using STrrr = SparseTensor<MP, RealType, RealType, RealType>;
+    using STrcc = SparseTensor<MP, RealType, ComplexType, ComplexType>;
+    if (STccc* p = boost::get<STccc>(this)) { p->vbias_fullG(std::forward<Args>(args)...); return; }
+    if (STrrr* p = boost::get<STrrr>(this)) { p->vbias_fullG(std::forward<Args>(args)...); return; }
+    if (STrcc* p = boost::get<STrcc>(this)) { p->vbias_fullG(std::forward<Args>(args)...); return; }
+    throw std::runtime_error("vbias_fullG (Phase 3b un-rotated full-G force bias) is only implemented for the "
+                             "Cholesky HamiltonianOperations (Real3IndexFactorization / SparseTensor).");
+  }
+
   template<class... Args>
   void generalizedFockMatrix(Args&&... args)
   {

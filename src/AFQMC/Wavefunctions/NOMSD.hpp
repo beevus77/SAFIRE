@@ -630,6 +630,27 @@ protected:
     HamOp.energy(std::forward<Mat>(E), G, nd, addH1);
   }
 
+  /*
+     * Phase 3b (StochasticWfn) seams over the un-rotated full-G HamOp paths. Unlike energy_from_G /
+     * vbias (which use the per-trial-determinant half-rotated integrals tied to determinant nd's bra),
+     * these contract the full Cholesky / bare one-body against a FULL NMO x NMO mixed density matrix, so
+     * they are valid for a propagated inner walker that has left the trial anchor. Protected +
+     * friend-accessible; not part of the public interface. CPU Cholesky Hamiltonian only (the HamOp
+     * dispatch throws otherwise) and CLOSED trials this phase.
+     */
+  template<class Mat, class MatG>
+  void energy_from_fullG(Mat&& E, MatG const& G, bool addH1 = true)
+  {
+    HamOp.energy_fullG(std::forward<Mat>(E), G, addH1);
+  }
+
+  template<class MatG, class MatA>
+  void vbias_fullG(const MatG& G, MatA&& v, double dt, double a = 1.0)
+  {
+    HamOp.vbias_fullG(G, std::forward<MatA>(v), dt, a);
+    TG.TG_local().barrier();
+  }
+
   template<class WlkSet, class MatG, class TVec>
   void MixedDensityMatrix_shared(const WlkSet& wset, MatG&& G, TVec&& Ov, bool compact = true, bool transpose = false);
 
